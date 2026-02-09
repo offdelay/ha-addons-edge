@@ -1,5 +1,6 @@
 import path from 'path';
 import dotenv from 'dotenv';
+import fs from 'fs';
 
 dotenv.config();
 
@@ -12,14 +13,26 @@ export interface HaConfig {
   supervisorApiUrl?: string;
 }
 
+export interface FirmwareConfig {
+  lanPort: number;
+  lanIpOverride?: string;
+  cacheDir: string;
+  maxVersionsPerDevice: number;
+}
+
 export interface AppConfig {
   port: number;
   ha: HaConfig;
   frontendDist: string | null;
+  firmware: FirmwareConfig;
 }
 
-const DEFAULT_PORT = 3000;
+const DEFAULT_PORT = 42069;
+const DEFAULT_FIRMWARE_LAN_PORT = 38080;
+const DEFAULT_MAX_VERSIONS_PER_DEVICE = 3;
 const DEFAULT_FRONTEND_DIST = path.resolve(__dirname, '../../frontend/dist');
+const DEFAULT_DATA_DIR = '/config/everything-presence-zone-configurator';
+const DEFAULT_FIRMWARE_CACHE_DIR = path.join(process.env.DATA_DIR ?? DEFAULT_DATA_DIR, 'fw_cache');
 
 const trimTrailingSlash = (value: string): string => value.replace(/\/+$/, '');
 
@@ -61,7 +74,20 @@ const detectHaConfig = (): HaConfig => {
   }
 
   const standaloneUrl = process.env.HA_BASE_URL;
-  const standaloneToken = process.env.HA_LONG_LIVED_TOKEN;
+  const tokenFromEnv = process.env.HA_LONG_LIVED_TOKEN;
+  const tokenFilePath = process.env.HA_LONG_LIVED_TOKEN_FILE;
+  
+  let standaloneToken: string | undefined = tokenFromEnv;
+  
+  if (tokenFilePath) {
+    try {
+      standaloneToken = fs.readFileSync(tokenFilePath, 'utf8').trim();
+    } catch (err) {
+      throw new Error(
+        `Failed to read HA_LONG_LIVED_TOKEN_FILE at "${tokenFilePath}": ${(err as Error).message}`
+      );
+    }
+  }
 
   if (standaloneUrl && standaloneToken) {
     return {
@@ -72,8 +98,17 @@ const detectHaConfig = (): HaConfig => {
   }
 
   throw new Error(
-    'Home Assistant credentials are not configured. Provide SUPERVISOR_TOKEN (add-on) or HA_BASE_URL and HA_LONG_LIVED_TOKEN (standalone).',
+    'Home Assistant credentials are not configured. Provide SUPERVISOR_TOKEN (add-on) or HA_BASE_URL and HA_LONG_LIVED_TOKEN/HA_LONG_LIVED_TOKEN_FILE (standalone).',
   );
+};
+
+const loadFirmwareConfig = (): FirmwareConfig => {
+  return {
+    lanPort: parsePort(process.env.FIRMWARE_LAN_PORT) || DEFAULT_FIRMWARE_LAN_PORT,
+    lanIpOverride: process.env.FIRMWARE_LAN_IP || undefined,
+    cacheDir: process.env.FIRMWARE_CACHE_DIR ?? DEFAULT_FIRMWARE_CACHE_DIR,
+    maxVersionsPerDevice: Number(process.env.FIRMWARE_MAX_VERSIONS) || DEFAULT_MAX_VERSIONS_PER_DEVICE,
+  };
 };
 
 export const loadConfig = (): AppConfig => {
@@ -85,6 +120,7 @@ export const loadConfig = (): AppConfig => {
     frontendDist: process.env.FRONTEND_DIST
       ? path.resolve(process.env.FRONTEND_DIST)
       : DEFAULT_FRONTEND_DIST,
+    firmware: loadFirmwareConfig(),
   };
 };
 

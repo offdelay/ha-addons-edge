@@ -1,5 +1,5 @@
 import React, { useMemo, useState, useEffect, useCallback, useRef } from 'react';
-import { DiscoveredDevice, DeviceProfile, RoomConfig, ZoneRect, ZonePolygon, FurnitureInstance, FurnitureType, Door, EntityMappings } from '../api/types';
+import { DiscoveredDevice, DeviceProfile, RoomConfig, ZoneRect, ZonePolygon, FurnitureInstance, FurnitureType, Door, EntityMappings, LiveState } from '../api/types';
 import { RoomCanvas, Point, DevicePlacement } from '../components/RoomCanvas';
 import { ZoneCanvas } from '../components/ZoneCanvas';
 import { ZoneEditor } from '../components/ZoneEditor';
@@ -13,8 +13,8 @@ import { useWallDrawing } from '../hooks/useWallDrawing';
 import { pushZonesToDevice, fetchZonesFromDevice, fetchPolygonModeStatus, setPolygonMode, fetchPolygonZonesFromDevice, pushPolygonZonesToDevice, PolygonModeStatus } from '../api/zones';
 import { fetchZoneAvailability, ingressAware } from '../api/client';
 import { useDeviceMappings } from '../contexts/DeviceMappingsContext';
-import { getEffectiveEntityPrefix } from '../utils/entityUtils';
 import { getInstallationAngleSuggestion } from '../utils/rotationSuggestion';
+import { useDisplaySettings } from '../hooks/useDisplaySettings';
 
 interface WizardPageProps {
   devices: DiscoveredDevice[];
@@ -37,6 +37,15 @@ interface WizardPageProps {
   setOutlineDone: (val: boolean) => void;
   setPlacementDone: (val: boolean) => void;
   setZonesReady: (val: boolean) => void;
+  liveState?: LiveState | null;
+  targetPositions?: Array<{
+    id: number;
+    x: number;
+    y: number;
+    distance: number | null;
+    speed: number | null;
+    angle: number | null;
+  }>;
 }
 
 type StepKey =
@@ -72,6 +81,8 @@ export const WizardPage: React.FC<WizardPageProps> = ({
   setOutlineDone,
   setPlacementDone,
   setZonesReady,
+  liveState,
+  targetPositions,
 }) => {
   const [deviceId, setDeviceId] = useState<string | null>(selectedDeviceId ?? null);
   const [profileId, setProfileId] = useState<string | null>(selectedProfileId ?? null);
@@ -89,6 +100,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
 
   // Canvas controls for embedded room drawing
   const [canvasZoom, setCanvasZoom] = useState(1.1);
+  const [isCanvasDragging, setIsCanvasDragging] = useState(false);
   const [canvasSnap, setCanvasSnap] = useState(100);
   const [canvasPan, setCanvasPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
 
@@ -97,6 +109,9 @@ export const WizardPage: React.FC<WizardPageProps> = ({
 
   // Radar overlay clipping toggle
   const [clipRadarToWalls, setClipRadarToWalls] = useState(true);
+
+  // Display settings for live tracking and device icon
+  const { showTargets, setShowTargets, showDeviceIcon, setShowDeviceIcon } = useDisplaySettings();
 
   // Cursor position tracking
   const [cursorPos, setCursorPos] = useState<{ x: number; y: number } | null>(null);
@@ -174,16 +189,33 @@ export const WizardPage: React.FC<WizardPageProps> = ({
     return Boolean(caps?.tracking) && !caps?.distanceOnlyTracking;
   }, [currentProfile]);
 
+  // Device mappings context - used for entity resolution and validation
+  const { hasValidMappings, getEntityId, getMapping } = useDeviceMappings();
+
+  // Pre-load device mapping into cache when device is selected
+  // This ensures getEntityId works for installation angle resolution
+  useEffect(() => {
+    if (selectedRoom?.deviceId) {
+      getMapping(selectedRoom.deviceId);
+    }
+  }, [selectedRoom?.deviceId, getMapping]);
+
   const resolveInstallationAngleEntityId = useCallback(() => {
     if (!selectedRoom) return null;
+
+    // First try device mappings (new system - supports EPP and EPL)
+    if (selectedRoom.deviceId) {
+      const entityFromMapping = getEntityId(selectedRoom.deviceId, 'installationAngle');
+      if (entityFromMapping) return entityFromMapping;
+    }
+
+    // Fall back to legacy room-level mapping
     const mappingEntity = selectedRoom.entityMappings?.installationAngleEntity;
     if (mappingEntity) return mappingEntity;
 
-    const devicePrefix = selectedRoom.entityNamePrefix ?? selectedDevice?.entityNamePrefix;
-    const prefix = getEffectiveEntityPrefix(selectedRoom.entityMappings, devicePrefix);
-    if (!prefix) return null;
-    return `number.${prefix}_installation_angle`;
-  }, [selectedRoom, selectedDevice]);
+    // No mapping found - return null (user should run entity discovery)
+    return null;
+  }, [selectedRoom, getEntityId]);
 
   const handleRotationSuggestion = useCallback(
     (rotationDeg: number) => {
@@ -235,8 +267,6 @@ export const WizardPage: React.FC<WizardPageProps> = ({
     }
   }, [selectedRoom?.deviceId, rotationSuggestion, resolveInstallationAngleEntityId]);
 
-  // Device mappings context - used to check if device has valid entity mappings
-  const { hasValidMappings } = useDeviceMappings();
   const deviceHasValidMappings = selectedRoom?.deviceId ? hasValidMappings(selectedRoom.deviceId) : false;
   const isZeroSuggestion = rotationSuggestion?.suggestedAngle === 0;
 
@@ -245,7 +275,11 @@ export const WizardPage: React.FC<WizardPageProps> = ({
   const [polygonZonesAvailable, setPolygonZonesAvailable] = useState<boolean | null>(null);
 
   // Polygon mode state
-  const [polygonModeStatus, setPolygonModeStatus] = useState<PolygonModeStatus>({ supported: false, enabled: false });
+  const [polygonModeStatus, setPolygonModeStatus] = useState<PolygonModeStatus>({
+    supported: false,
+    enabled: false,
+    controllable: false,
+  });
   const [polygonZones, setPolygonZones] = useState<ZonePolygon[]>([]);
   const [showPolygonPrompt, setShowPolygonPrompt] = useState(false);
   const [togglingPolygonMode, setTogglingPolygonMode] = useState(false);
@@ -254,7 +288,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
 
   // Reset polygon mode state when room/device changes
   useEffect(() => {
-    setPolygonModeStatus({ supported: false, enabled: false });
+    setPolygonModeStatus({ supported: false, enabled: false, controllable: false });
     setPolygonZones([]);
     setShowPolygonPrompt(false);
     // Clear the prompt shown tracking so it can show again for the new room
@@ -319,15 +353,16 @@ export const WizardPage: React.FC<WizardPageProps> = ({
         : [...base, 'roomDetails', 'placement', 'finish'];
     }
 
-    // New room (default): device → entityDiscovery → roomChoice → roomDetails → outline → doors → furniture → placement → (zones if supported) → finish
+    // New room (default): device → entityDiscovery → roomChoice → roomDetails → outline → placement → doors → furniture → (zones if supported) → finish
+    // Device placement after outline so room shape exists, but before doors/furniture so live tracking can help position them
     return supportsZones
-      ? [...base, 'roomDetails', 'outline', 'doors', 'furniture', 'placement', 'zones', 'finish']
-      : [...base, 'roomDetails', 'outline', 'doors', 'furniture', 'placement', 'finish'];
+      ? [...base, 'roomDetails', 'outline', 'placement', 'doors', 'furniture', 'zones', 'finish']
+      : [...base, 'roomDetails', 'outline', 'placement', 'doors', 'furniture', 'finish'];
   }, [roomPath, currentProfile]);
 
   const [stepIndex, setStepIndex] = useState<number>(() => {
     // Initialize with default 'new' room path steps for initialStep lookup
-    const defaultSteps: StepKey[] = ['device', 'entityDiscovery', 'roomChoice', 'roomDetails', 'outline', 'doors', 'furniture', 'placement', 'zones', 'finish'];
+    const defaultSteps: StepKey[] = ['device', 'entityDiscovery', 'roomChoice', 'roomDetails', 'outline', 'placement', 'doors', 'furniture', 'zones', 'finish'];
     const idx = defaultSteps.indexOf(initialStep as StepKey);
     return idx >= 0 ? idx : 0;
   });
@@ -828,7 +863,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
       }
 
       if (!entityNamePrefix) {
-        setPolygonModeStatus({ supported: false, enabled: false });
+        setPolygonModeStatus({ supported: false, enabled: false, controllable: false });
         return;
       }
 
@@ -866,7 +901,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
         // entities do exist.
       } catch (err) {
         console.error('Failed to fetch polygon mode status:', err);
-        setPolygonModeStatus({ supported: false, enabled: false });
+        setPolygonModeStatus({ supported: false, enabled: false, controllable: false });
       }
     };
 
@@ -1180,7 +1215,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
       }
 
       // Update local state
-      setPolygonModeStatus({ supported: true, enabled: true });
+      setPolygonModeStatus({ supported: true, enabled: true, controllable: true });
       setPolygonZones(convertedZones);
       setShowPolygonPrompt(false);
     } catch (err) {
@@ -1373,6 +1408,20 @@ export const WizardPage: React.FC<WizardPageProps> = ({
         <div
           className="h-full w-full"
           onWheelCapture={(e) => {
+            if (isCanvasDragging) return;
+            // Check if the event target is within a scrollable container (like zone list panel)
+            // If so, let the native scroll happen instead of zooming
+            let target = e.target as HTMLElement | null;
+            while (target && target !== e.currentTarget) {
+              const style = window.getComputedStyle(target);
+              const overflowY = style.overflowY;
+              if (overflowY === 'auto' || overflowY === 'scroll') {
+                // Target is in a scrollable container, don't zoom
+                return;
+              }
+              target = target.parentElement;
+            }
+
             if (e.cancelable) e.preventDefault();
             e.stopPropagation();
             const delta = e.deltaY > 0 ? -0.1 : 0.1;
@@ -1385,6 +1434,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
               onChange={handleRoomOutlineChange}
               onCanvasClick={wallDrawingClick}
               onCanvasMove={wallDrawingMove}
+              onDragStateChange={setIsCanvasDragging}
               previewFrom={pendingStart}
               previewTo={pendingStart && previewPoint ? previewPoint : null}
               rangeMm={15000}
@@ -1393,6 +1443,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
               zoom={canvasZoom}
               panOffsetMm={canvasPan}
               onPanChange={setCanvasPan}
+              onDragStateChange={setIsCanvasDragging}
               displayUnits={units}
             />
           )}
@@ -1408,6 +1459,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
               zoom={canvasZoom}
               panOffsetMm={canvasPan}
               onPanChange={setCanvasPan}
+              onDragStateChange={setIsCanvasDragging}
               displayUnits={units}
               doors={selectedRoom?.doors ?? []}
               selectedDoorId={selectedDoorId}
@@ -1419,6 +1471,34 @@ export const WizardPage: React.FC<WizardPageProps> = ({
               onDoorDragMove={handleDoorDragMove}
               onDoorDragEnd={handleDoorDragEnd}
               showDoors={true}
+              devicePlacement={showDeviceIcon ? selectedRoom?.devicePlacement : undefined}
+              fieldOfViewDeg={currentProfile?.limits?.fieldOfViewDegrees}
+              maxRangeMeters={currentProfile?.limits?.maxRangeMeters}
+              deviceIconUrl={currentProfile?.iconUrl}
+              clipRadarToWalls={clipRadarToWalls}
+              renderOverlay={({ toCanvas }) => {
+                if (!showTargets || !targetPositions?.length) return null;
+                const targetColors = [
+                  { fill: '#3b82f6', fillOpacity: 'rgba(59, 130, 246, 0.2)' },
+                  { fill: '#10b981', fillOpacity: 'rgba(16, 185, 129, 0.2)' },
+                  { fill: '#f59e0b', fillOpacity: 'rgba(245, 158, 11, 0.2)' },
+                ];
+                return (
+                  <g style={{ pointerEvents: 'none' }}>
+                    {targetPositions.map((target, idx) => {
+                      const pos = toCanvas({ x: target.x, y: target.y });
+                      const colors = targetColors[idx % targetColors.length];
+                      return (
+                        <g key={target.id}>
+                          <circle cx={pos.x} cy={pos.y} r={25} fill={colors.fillOpacity} stroke={colors.fill} strokeWidth={1.5} />
+                          <circle cx={pos.x} cy={pos.y} r={10} fill={colors.fill} />
+                          <text x={pos.x} y={pos.y - 35} fill={colors.fill} fontSize="12" fontWeight="600" textAnchor="middle">T{target.id}</text>
+                        </g>
+                      );
+                    })}
+                  </g>
+                );
+              }}
             />
           )}
 
@@ -1433,6 +1513,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
               zoom={canvasZoom}
               panOffsetMm={canvasPan}
               onPanChange={setCanvasPan}
+              onDragStateChange={setIsCanvasDragging}
               displayUnits={units}
               doors={selectedRoom?.doors ?? []}
               showDoors={true}
@@ -1444,6 +1525,34 @@ export const WizardPage: React.FC<WizardPageProps> = ({
               }}
               onFurnitureChange={handleFurnitureChange}
               showFurniture={true}
+              devicePlacement={showDeviceIcon ? selectedRoom?.devicePlacement : undefined}
+              fieldOfViewDeg={currentProfile?.limits?.fieldOfViewDegrees}
+              maxRangeMeters={currentProfile?.limits?.maxRangeMeters}
+              deviceIconUrl={currentProfile?.iconUrl}
+              clipRadarToWalls={clipRadarToWalls}
+              renderOverlay={({ toCanvas }) => {
+                if (!showTargets || !targetPositions?.length) return null;
+                const targetColors = [
+                  { fill: '#3b82f6', fillOpacity: 'rgba(59, 130, 246, 0.2)' },
+                  { fill: '#10b981', fillOpacity: 'rgba(16, 185, 129, 0.2)' },
+                  { fill: '#f59e0b', fillOpacity: 'rgba(245, 158, 11, 0.2)' },
+                ];
+                return (
+                  <g style={{ pointerEvents: 'none' }}>
+                    {targetPositions.map((target, idx) => {
+                      const pos = toCanvas({ x: target.x, y: target.y });
+                      const colors = targetColors[idx % targetColors.length];
+                      return (
+                        <g key={target.id}>
+                          <circle cx={pos.x} cy={pos.y} r={25} fill={colors.fillOpacity} stroke={colors.fill} strokeWidth={1.5} />
+                          <circle cx={pos.x} cy={pos.y} r={10} fill={colors.fill} />
+                          <text x={pos.x} y={pos.y - 35} fill={colors.fill} fontSize="12" fontWeight="600" textAnchor="middle">T{target.id}</text>
+                        </g>
+                      );
+                    })}
+                  </g>
+                );
+              }}
             />
           )}
 
@@ -1475,6 +1584,29 @@ export const WizardPage: React.FC<WizardPageProps> = ({
               showFurniture={true}
               doors={selectedRoom?.doors ?? []}
               showDoors={true}
+              renderOverlay={({ toCanvas }) => {
+                if (!showTargets || !targetPositions?.length) return null;
+                const targetColors = [
+                  { fill: '#3b82f6', fillOpacity: 'rgba(59, 130, 246, 0.2)' },
+                  { fill: '#10b981', fillOpacity: 'rgba(16, 185, 129, 0.2)' },
+                  { fill: '#f59e0b', fillOpacity: 'rgba(245, 158, 11, 0.2)' },
+                ];
+                return (
+                  <g style={{ pointerEvents: 'none' }}>
+                    {targetPositions.map((target, idx) => {
+                      const pos = toCanvas({ x: target.x, y: target.y });
+                      const colors = targetColors[idx % targetColors.length];
+                      return (
+                        <g key={target.id}>
+                          <circle cx={pos.x} cy={pos.y} r={25} fill={colors.fillOpacity} stroke={colors.fill} strokeWidth={1.5} />
+                          <circle cx={pos.x} cy={pos.y} r={10} fill={colors.fill} />
+                          <text x={pos.x} y={pos.y - 35} fill={colors.fill} fontSize="12" fontWeight="600" textAnchor="middle">T{target.id}</text>
+                        </g>
+                      );
+                    })}
+                  </g>
+                );
+              }}
             />
           )}
 
@@ -1482,6 +1614,18 @@ export const WizardPage: React.FC<WizardPageProps> = ({
             <div
               className="h-full w-full overflow-hidden overscroll-contain touch-none"
               onWheelCapture={(e) => {
+                if (isCanvasDragging) return;
+                // Check if the event target is within a scrollable container
+                let target = e.target as HTMLElement | null;
+                while (target && target !== e.currentTarget) {
+                  const style = window.getComputedStyle(target);
+                  const overflowY = style.overflowY;
+                  if (overflowY === 'auto' || overflowY === 'scroll') {
+                    return;
+                  }
+                  target = target.parentElement;
+                }
+
                 if (e.cancelable) e.preventDefault();
                 if ((e.nativeEvent as any)?.cancelable) {
                   (e.nativeEvent as any).preventDefault();
@@ -1508,6 +1652,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
                 onSelect={setSelectedZoneId}
                 roomShell={isRoomMode ? selectedRoom?.roomShell : undefined}
                 devicePlacement={selectedRoom?.devicePlacement} // Always show device placement, even in skip mode
+                installationAngle={liveState?.config?.installationAngle}
                 fieldOfViewDeg={currentProfile?.limits?.fieldOfViewDegrees}
                 maxRangeMeters={currentProfile?.limits?.maxRangeMeters}
                 deviceIconUrl={currentProfile?.iconUrl}
@@ -1521,6 +1666,29 @@ export const WizardPage: React.FC<WizardPageProps> = ({
                 clipRadarToWalls={clipRadarToWalls}
                 furniture={selectedRoom?.furniture}
                 doors={selectedRoom?.doors}
+                renderOverlay={({ toCanvas }) => {
+                  if (!showTargets || !targetPositions?.length) return null;
+                  const targetColors = [
+                    { fill: '#3b82f6', fillOpacity: 'rgba(59, 130, 246, 0.2)' },
+                    { fill: '#10b981', fillOpacity: 'rgba(16, 185, 129, 0.2)' },
+                    { fill: '#f59e0b', fillOpacity: 'rgba(245, 158, 11, 0.2)' },
+                  ];
+                  return (
+                    <g style={{ pointerEvents: 'none' }}>
+                      {targetPositions.map((target, idx) => {
+                        const pos = toCanvas({ x: target.x, y: target.y });
+                        const colors = targetColors[idx % targetColors.length];
+                        return (
+                          <g key={target.id}>
+                            <circle cx={pos.x} cy={pos.y} r={25} fill={colors.fillOpacity} stroke={colors.fill} strokeWidth={1.5} />
+                            <circle cx={pos.x} cy={pos.y} r={10} fill={colors.fill} />
+                            <text x={pos.x} y={pos.y - 35} fill={colors.fill} fontSize="12" fontWeight="600" textAnchor="middle">T{target.id}</text>
+                          </g>
+                        );
+                      })}
+                    </g>
+                  );
+                }}
               />
             </div>
           )}
@@ -1645,6 +1813,34 @@ export const WizardPage: React.FC<WizardPageProps> = ({
                   {selectedRoom?.doors?.length} door{(selectedRoom?.doors?.length ?? 0) !== 1 ? 's' : ''} placed
                 </div>
               )}
+              {/* Display Toggles */}
+              <div className="rounded-xl border border-slate-700/50 bg-slate-900/90 backdrop-blur px-4 py-3 shadow-lg space-y-2">
+                <label className="flex items-center gap-2 cursor-pointer text-sm text-slate-200 hover:text-white transition-colors">
+                  <input
+                    type="checkbox"
+                    checked={showTargets}
+                    onChange={(e) => setShowTargets(e.target.checked)}
+                    className="w-4 h-4 rounded border-slate-600 bg-slate-800 text-blue-500 focus:ring-blue-500 focus:ring-offset-0"
+                  />
+                  <span className="flex items-center gap-1.5">
+                    <span className="w-2.5 h-2.5 rounded-full bg-blue-500"></span>
+                    Live Tracking
+                    {!liveState?.deviceId && <span className="text-slate-500 text-xs ml-1">(No device)</span>}
+                  </span>
+                </label>
+                <label className="flex items-center gap-2 cursor-pointer text-sm text-slate-200 hover:text-white transition-colors">
+                  <input
+                    type="checkbox"
+                    checked={showDeviceIcon}
+                    onChange={(e) => setShowDeviceIcon(e.target.checked)}
+                    className="w-4 h-4 rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500 focus:ring-offset-0"
+                  />
+                  <span className="flex items-center gap-1.5">
+                    <span className="text-sm">📡</span>
+                    Device Icon
+                  </span>
+                </label>
+              </div>
             </div>
           )}
 
@@ -1670,6 +1866,34 @@ export const WizardPage: React.FC<WizardPageProps> = ({
                   {selectedRoom?.furniture?.length} item{(selectedRoom?.furniture?.length ?? 0) !== 1 ? 's' : ''} placed
                 </div>
               )}
+              {/* Display Toggles */}
+              <div className="rounded-xl border border-slate-700/50 bg-slate-900/90 backdrop-blur px-4 py-3 shadow-lg space-y-2">
+                <label className="flex items-center gap-2 cursor-pointer text-sm text-slate-200 hover:text-white transition-colors">
+                  <input
+                    type="checkbox"
+                    checked={showTargets}
+                    onChange={(e) => setShowTargets(e.target.checked)}
+                    className="w-4 h-4 rounded border-slate-600 bg-slate-800 text-blue-500 focus:ring-blue-500 focus:ring-offset-0"
+                  />
+                  <span className="flex items-center gap-1.5">
+                    <span className="w-2.5 h-2.5 rounded-full bg-blue-500"></span>
+                    Live Tracking
+                    {!liveState?.deviceId && <span className="text-slate-500 text-xs ml-1">(No device)</span>}
+                  </span>
+                </label>
+                <label className="flex items-center gap-2 cursor-pointer text-sm text-slate-200 hover:text-white transition-colors">
+                  <input
+                    type="checkbox"
+                    checked={showDeviceIcon}
+                    onChange={(e) => setShowDeviceIcon(e.target.checked)}
+                    className="w-4 h-4 rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500 focus:ring-offset-0"
+                  />
+                  <span className="flex items-center gap-1.5">
+                    <span className="text-sm">📡</span>
+                    Device Icon
+                  </span>
+                </label>
+              </div>
             </div>
           )}
 
@@ -1686,6 +1910,23 @@ export const WizardPage: React.FC<WizardPageProps> = ({
               >
                 {showZoneList ? '✕ Hide' : '☰ Show'} {polygonModeStatus.enabled ? `Polygon Zones (${polygonZones.length})` : `Zone Slots (${enabledZones.length}/${displayZones.length})`}
               </button>
+
+              {/* Live Tracking Toggle */}
+              <div className="rounded-xl border border-slate-700/50 bg-slate-900/90 backdrop-blur px-4 py-3 shadow-lg">
+                <label className="flex items-center gap-2 cursor-pointer text-sm text-slate-200 hover:text-white transition-colors">
+                  <input
+                    type="checkbox"
+                    checked={showTargets}
+                    onChange={(e) => setShowTargets(e.target.checked)}
+                    className="w-4 h-4 rounded border-slate-600 bg-slate-800 text-blue-500 focus:ring-blue-500 focus:ring-offset-0"
+                  />
+                  <span className="flex items-center gap-1.5">
+                    <span className="w-2.5 h-2.5 rounded-full bg-blue-500"></span>
+                    Live Tracking
+                    {!liveState?.deviceId && <span className="text-slate-500 text-xs ml-1">(No device)</span>}
+                  </span>
+                </label>
+              </div>
 
               {/* Polygon mode prompt - show when supported but not enabled */}
               {showPolygonPrompt && !polygonModeStatus.enabled && (
@@ -2291,11 +2532,27 @@ export const WizardPage: React.FC<WizardPageProps> = ({
                         ? 'border-slate-800 bg-slate-900/30 opacity-50 cursor-not-allowed'
                         : 'border-slate-800 bg-slate-900/60 cursor-pointer hover:border-slate-700 hover:bg-slate-900/80 hover:scale-102'
                     }`}
-                    onClick={() => {
+                    onClick={async () => {
                       if (hasDevice) return;
                       setRoomId(room.id);
                       if (room.profileId) setProfileId(room.profileId);
                       onSelectRoom(room.id, room.profileId ?? profileId ?? null);
+
+                      // Link the device to this existing room
+                      // Don't pass entityMappings - device mapping is source of truth
+                      if (deviceId) {
+                        try {
+                          const updatedRoom = await updateRoom(room.id, {
+                            deviceId,
+                            profileId: profileId ?? room.profileId,
+                          });
+                          onRoomUpdate?.(updatedRoom.room);
+                        } catch (err) {
+                          console.error('Failed to link device to room:', err);
+                          // Continue anyway - user can fix via settings
+                        }
+                      }
+
                       // Auto-advance to next step after brief delay for visual feedback
                       setTimeout(() => {
                         nextStep();
@@ -2392,6 +2649,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
             className="relative -mx-[calc((100vw-min(1152px,100vw))/2+1.5rem)] border-y border-slate-800 bg-slate-950/70 overflow-hidden"
             style={{ height: 'calc(100vh - 380px)', minHeight: '500px' }}
             onWheelCapture={(e) => {
+              if (isCanvasDragging) return;
               if (e.cancelable) e.preventDefault();
               e.stopPropagation();
               const delta = e.deltaY > 0 ? -0.1 : 0.1;
@@ -2403,6 +2661,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
               onChange={handleRoomOutlineChange}
               onCanvasClick={wallDrawingClick}
               onCanvasMove={wallDrawingMove}
+              onDragStateChange={setIsCanvasDragging}
               previewFrom={pendingStart}
               previewTo={pendingStart && previewPoint ? previewPoint : null}
               rangeMm={15000}
@@ -2411,6 +2670,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
               zoom={canvasZoom}
               panOffsetMm={canvasPan}
               onPanChange={setCanvasPan}
+              onDragStateChange={setIsCanvasDragging}
               displayUnits={units}
             />
 
@@ -2485,6 +2745,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
             className="relative -mx-[calc((100vw-min(1152px,100vw))/2+1.5rem)] border-y border-slate-800 bg-slate-950/70 overflow-hidden"
             style={{ height: 'calc(100vh - 380px)', minHeight: '500px' }}
             onWheelCapture={(e) => {
+              if (isCanvasDragging) return;
               if (e.cancelable) e.preventDefault();
               e.stopPropagation();
               const delta = e.deltaY > 0 ? -0.1 : 0.1;
@@ -2557,6 +2818,21 @@ export const WizardPage: React.FC<WizardPageProps> = ({
                   {v === 0 ? 'Off' : `${v}mm`}
                 </button>
               ))}
+              <div className="flex items-center gap-2 ml-4 pl-4 border-l border-slate-700">
+                <label className="flex items-center gap-2 cursor-pointer text-slate-300 hover:text-white transition-colors">
+                  <input
+                    type="checkbox"
+                    checked={showTargets}
+                    onChange={(e) => setShowTargets(e.target.checked)}
+                    className="w-3.5 h-3.5 rounded border-slate-600 bg-slate-800 text-blue-500 focus:ring-blue-500 focus:ring-offset-0"
+                  />
+                  <span className="flex items-center gap-1.5">
+                    <span className="w-2 h-2 rounded-full bg-blue-500"></span>
+                    Live Tracking
+                    {!liveState?.deviceId && <span className="text-slate-500">(No device)</span>}
+                  </span>
+                </label>
+              </div>
               <span className="ml-auto text-slate-500">Drag device • Right-drag to pan • Wheel to zoom</span>
             </div>
           </div>
@@ -2787,6 +3063,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
             className="relative -mx-[calc((100vw-min(1152px,100vw))/2+1.5rem)] border-y border-slate-800 bg-slate-950/70 overflow-hidden"
             style={{ height: 'calc(100vh - 420px)', minHeight: '500px' }}
             onWheelCapture={(e) => {
+              if (isCanvasDragging) return;
               if (e.cancelable) e.preventDefault();
               e.stopPropagation();
               const delta = e.deltaY > 0 ? -0.1 : 0.1;
@@ -2810,6 +3087,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
               onSelect={setSelectedZoneId}
               roomShell={isRoomMode ? selectedRoom?.roomShell : undefined}
               devicePlacement={isRoomMode ? selectedRoom?.devicePlacement : undefined}
+              installationAngle={liveState?.config?.installationAngle}
               fieldOfViewDeg={currentProfile?.limits?.fieldOfViewDegrees}
               maxRangeMeters={currentProfile?.limits?.maxRangeMeters}
               deviceIconUrl={currentProfile?.iconUrl}

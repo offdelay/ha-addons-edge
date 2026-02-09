@@ -14,6 +14,8 @@ export interface DeviceMapping {
   profileId: string;
   /** Human-readable device name */
   deviceName: string;
+  /** ESPHome node name (service prefix), if available */
+  esphomeNodeName?: string;
   /** ISO timestamp when entities were discovered */
   discoveredAt: string;
   /** ISO timestamp when mapping was last updated */
@@ -28,8 +30,14 @@ export interface DeviceMapping {
   mappings: Record<string, string>;
   /** Entity IDs that exist on device but weren't matched to profile */
   unmappedEntities: string[];
+  /** Entity original object ids keyed by entity ID */
+  entityOriginalObjectIds?: Record<string, string>;
+  /** Entity unique ids keyed by entity ID */
+  entityUniqueIds?: Record<string, string>;
   /** Unit of measurement for specific entities (e.g., "target1X" -> "in" or "mm") */
   entityUnits?: Record<string, string>;
+  /** Zone labels keyed by zone ID (e.g., "Zone 1" -> "Bed", "Exclusion 2" -> "Window") */
+  zoneLabels?: Record<string, string>;
   /** Device firmware version (e.g., "1.4.1") - parsed from sw_version */
   firmwareVersion?: string;
   /** ESPHome version the device is running (e.g., "2025.11.2") - parsed from sw_version */
@@ -38,6 +46,10 @@ export interface DeviceMapping {
   rawSwVersion?: string;
   /** Schema version from device profile at time of last sync (e.g., "1.0") */
   profileSchemaVersion?: string;
+  /** Manually mapped ESPHome service names (e.g., "getBuildFlags" -> "esphome.device_name_get_build_flags") */
+  serviceMappings?: Record<string, string>;
+  /** Whether service mappings were confirmed by user (don't overwrite during re-sync) */
+  serviceConfirmedByUser?: boolean;
 }
 
 /**

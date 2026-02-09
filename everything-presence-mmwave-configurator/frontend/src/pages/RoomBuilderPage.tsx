@@ -9,8 +9,8 @@ import { FurnitureEditor } from '../components/FurnitureEditor';
 import { DoorEditor } from '../components/DoorEditor';
 import { FLOOR_MATERIALS } from '../components/FloorMaterials';
 import { useDisplaySettings } from '../hooks/useDisplaySettings';
-import { getEffectiveEntityPrefix } from '../utils/entityUtils';
 import { getInstallationAngleSuggestion } from '../utils/rotationSuggestion';
+import { useDeviceMappings } from '../contexts/DeviceMappingsContext';
 
 interface RoomBuilderPageProps {
   onBack?: () => void;
@@ -38,6 +38,7 @@ export const RoomBuilderPage: React.FC<RoomBuilderPageProps> = ({
   initialProfileId,
   onWizardProgress,
   liveState,
+  targetPositions,
 }) => {
   const [devices, setDevices] = useState<DiscoveredDevice[]>([]);
   const [profiles, setProfiles] = useState<DeviceProfile[]>([]);
@@ -61,10 +62,12 @@ export const RoomBuilderPage: React.FC<RoomBuilderPageProps> = ({
     base: { x: number; y: number }[];
   } | null>(null);
   const [snapGridMm, setSnapGridMm] = useState(100); // 0.1m default snap
+  const [angleSnapEnabled, setAngleSnapEnabled] = useState(false);
   const [cursorPos, setCursorPos] = useState<{ x: number; y: number } | null>(null);
   const [cursorDelta, setCursorDelta] = useState<{ dx: number; dy: number; len: number } | null>(null);
   const [displayUnits, setDisplayUnits] = useState<'metric' | 'imperial'>('metric');
   const [zoom, setZoom] = useState(1.1);
+  const [isCanvasDragging, setIsCanvasDragging] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showNavMenu, setShowNavMenu] = useState(false);
   // Display settings (persisted to localStorage)
@@ -73,6 +76,7 @@ export const RoomBuilderPage: React.FC<RoomBuilderPageProps> = ({
     showFurniture, setShowFurniture,
     showDoors, setShowDoors,
     showDeviceIcon, setShowDeviceIcon,
+    showTargets, setShowTargets,
     clipRadarToWalls,
   } = useDisplaySettings();
   const [panOffsetMm, setPanOffsetMm] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
@@ -128,16 +132,25 @@ export const RoomBuilderPage: React.FC<RoomBuilderPageProps> = ({
     return Boolean(caps?.tracking) && !caps?.distanceOnlyTracking;
   }, [selectedProfile]);
 
+  // Device mappings context for entity resolution
+  const { getEntityId } = useDeviceMappings();
+
   const resolveInstallationAngleEntityId = useCallback(() => {
     if (!selectedRoom) return null;
+
+    // First try device mappings (new system - supports EPP and EPL)
+    if (selectedRoom.deviceId) {
+      const entityFromMapping = getEntityId(selectedRoom.deviceId, 'installationAngle');
+      if (entityFromMapping) return entityFromMapping;
+    }
+
+    // Fall back to legacy room-level mapping
     const mappingEntity = selectedRoom.entityMappings?.installationAngleEntity;
     if (mappingEntity) return mappingEntity;
 
-    const devicePrefix = selectedRoom.entityNamePrefix ?? selectedDevice?.entityNamePrefix;
-    const prefix = getEffectiveEntityPrefix(selectedRoom.entityMappings, devicePrefix);
-    if (!prefix) return null;
-    return `number.${prefix}_installation_angle`;
-  }, [selectedRoom, selectedDevice]);
+    // No mapping found - return null (user should run entity discovery)
+    return null;
+  }, [selectedRoom, getEntityId]);
 
   const handleRotationSuggestion = useCallback(
     (rotationDeg: number) => {
@@ -678,14 +691,36 @@ export const RoomBuilderPage: React.FC<RoomBuilderPageProps> = ({
     setHoveredSegment(null);
   };
 
-  const snapPointToGrid = (pt: { x: number; y: number }) => {
+  const snapPointToGrid = useCallback((pt: { x: number; y: number }) => {
     if (!snapGridMm || snapGridMm <= 0) return pt;
     const step = snapGridMm;
     return {
       x: Math.round(pt.x / step) * step,
       y: Math.round(pt.y / step) * step,
     };
-  };
+  }, [snapGridMm]);
+
+  const insertPointOnSegment = useCallback((segmentIndex: number, point?: { x: number; y: number }) => {
+    if (!selectedRoom?.roomShell?.points) return;
+    if (isDrawingWall || isDoorPlacementMode) return;
+    const pts = selectedRoom.roomShell.points;
+    if (pts.length < 2) return;
+    const a = pts[segmentIndex];
+    const b = pts[(segmentIndex + 1) % pts.length];
+    if (!a || !b) return;
+    const rawPoint = point ?? { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+    const snapped = snapPointToGrid(rawPoint);
+    const minDist = Math.min(
+      Math.hypot(snapped.x - a.x, snapped.y - a.y),
+      Math.hypot(snapped.x - b.x, snapped.y - b.y),
+    );
+    if (minDist < 50) return;
+    const insertIndex = segmentIndex === pts.length - 1 ? pts.length : segmentIndex + 1;
+    const next = [...pts];
+    next.splice(insertIndex, 0, snapped);
+    handlePointsChange(next);
+    setSelectedSegment(segmentIndex);
+  }, [selectedRoom, isDrawingWall, isDoorPlacementMode, snapPointToGrid, handlePointsChange]);
 
   const handleCanvasMove = (pt: { x: number; y: number }) => {
     setCursorPos(pt);
@@ -706,7 +741,9 @@ export const RoomBuilderPage: React.FC<RoomBuilderPageProps> = ({
     if (endpointDrag && selectedRoom) {
       let dx = pt.x - endpointDrag.start.x;
       let dy = pt.y - endpointDrag.start.y;
-      ({ dx, dy } = snapDelta(dx, dy));
+      if (angleSnapEnabled) {
+        ({ dx, dy } = snapDelta(dx, dy));
+      }
       const next = endpointDrag.base.map((p) => ({ x: p.x, y: p.y }));
       if (!next.length) return;
       const targetIdx =
@@ -727,7 +764,9 @@ export const RoomBuilderPage: React.FC<RoomBuilderPageProps> = ({
     if (segmentDragIndex !== null && segmentDragStart && segmentDragBase && selectedRoom) {
       let dx = pt.x - segmentDragStart.x;
       let dy = pt.y - segmentDragStart.y;
-      ({ dx, dy } = snapDelta(dx, dy));
+      if (angleSnapEnabled) {
+        ({ dx, dy } = snapDelta(dx, dy));
+      }
       const next = segmentDragBase.map((p) => ({ x: p.x, y: p.y }));
       const aIdx = segmentDragIndex;
       const bIdx = (segmentDragIndex + 1) % next.length;
@@ -760,13 +799,13 @@ export const RoomBuilderPage: React.FC<RoomBuilderPageProps> = ({
     }
   };
 
-  const handleAutoZoom = useCallback(() => {
-    if (!selectedRoom?.roomShell?.points?.length) {
+  const handleAutoZoom = useCallback((room: RoomConfig | null) => {
+    if (!room?.roomShell?.points?.length) {
       setZoom(1);
       setPanOffsetMm({ x: 0, y: 0 });
       return;
     }
-    const pts = selectedRoom.roomShell.points;
+    const pts = room.roomShell.points;
     const xs = pts.map((p) => p.x);
     const ys = pts.map((p) => p.y);
     const minX = Math.min(...xs);
@@ -781,13 +820,17 @@ export const RoomBuilderPage: React.FC<RoomBuilderPageProps> = ({
     const targetZoom = Math.min(5, Math.max(0.1, (0.8 * rangeMm) / maxDim));
     setZoom(targetZoom);
     setPanOffsetMm({ x: (minX + maxX) / 2, y: (minY + maxY) / 2 });
-  }, [selectedRoom, rangeMm]);
+  }, [rangeMm]);
 
   // Auto-zoom when room loads
   useEffect(() => {
-    if (selectedRoom?.roomShell?.points?.length) {
-      handleAutoZoom();
+    if (!selectedRoom) return;
+    if (selectedRoom.roomShell?.points?.length) {
+      handleAutoZoom(selectedRoom);
+      return;
     }
+    setZoom(1);
+    setPanOffsetMm({ x: 0, y: 0 });
   }, [selectedRoom?.id, handleAutoZoom]);
 
   const isSuggestionApplied =
@@ -964,6 +1007,7 @@ export const RoomBuilderPage: React.FC<RoomBuilderPageProps> = ({
         <div
           className="h-full w-full overflow-hidden overscroll-contain touch-none"
           onWheelCapture={(e) => {
+            if (isCanvasDragging) return;
             if (e.cancelable) e.preventDefault();
             if ((e.nativeEvent as any)?.cancelable) {
               (e.nativeEvent as any).preventDefault();
@@ -987,7 +1031,9 @@ export const RoomBuilderPage: React.FC<RoomBuilderPageProps> = ({
                     setCursorPos(null);
                     setCursorDelta(null);
                     handleDoorDragEnd();
+                    setIsCanvasDragging(false);
                   }}
+                  onDragStateChange={setIsCanvasDragging}
                   rangeMm={rangeMm}
                   gridSpacingMm={1000}
                   snapGridMm={snapGridMm}
@@ -1039,6 +1085,13 @@ export const RoomBuilderPage: React.FC<RoomBuilderPageProps> = ({
                     setSegmentDragStart(null);
                     setSegmentDragBase(null);
                   }}
+                  onSegmentInsert={
+                    !isDrawingWall && !isDoorPlacementMode
+                      ? (segmentIndex, point) => {
+                        insertPointOnSegment(segmentIndex, point);
+                      }
+                      : undefined
+                  }
                   height="100%"
                   furniture={selectedRoom.furniture ?? []}
                   selectedFurnitureId={selectedFurnitureId}
@@ -1062,6 +1115,55 @@ export const RoomBuilderPage: React.FC<RoomBuilderPageProps> = ({
                   showFurniture={showFurniture}
                   showDoors={showDoors}
                   showDevice={showDeviceIcon}
+                  renderOverlay={({ toCanvas }) => {
+                    if (!showTargets || !targetPositions?.length) return null;
+
+                    const targetColors = [
+                      { fill: '#3b82f6', fillOpacity: 'rgba(59, 130, 246, 0.2)' },
+                      { fill: '#10b981', fillOpacity: 'rgba(16, 185, 129, 0.2)' },
+                      { fill: '#f59e0b', fillOpacity: 'rgba(245, 158, 11, 0.2)' },
+                    ];
+
+                    return (
+                      <g style={{ pointerEvents: 'none' }}>
+                        {targetPositions.map((target, idx) => {
+                          const pos = toCanvas({ x: target.x, y: target.y });
+                          const colors = targetColors[idx % targetColors.length];
+                          return (
+                            <g key={target.id}>
+                              {/* Outer pulsing circle */}
+                              <circle
+                                cx={pos.x}
+                                cy={pos.y}
+                                r={25}
+                                fill={colors.fillOpacity}
+                                stroke={colors.fill}
+                                strokeWidth={1.5}
+                              />
+                              {/* Inner solid dot */}
+                              <circle
+                                cx={pos.x}
+                                cy={pos.y}
+                                r={10}
+                                fill={colors.fill}
+                              />
+                              {/* Label */}
+                              <text
+                                x={pos.x}
+                                y={pos.y - 35}
+                                fill={colors.fill}
+                                fontSize="12"
+                                fontWeight="600"
+                                textAnchor="middle"
+                              >
+                                T{target.id}
+                              </text>
+                            </g>
+                          );
+                        })}
+                      </g>
+                    );
+                  }}
                 />
           {/* Floating Room Selector (top center) */}
           <div className="absolute top-6 left-1/2 -translate-x-1/2 z-40 flex items-center gap-2 rounded-xl border border-slate-700/50 bg-slate-900/90 backdrop-blur px-4 py-2.5 text-sm text-slate-200 shadow-xl">
@@ -1184,7 +1286,7 @@ export const RoomBuilderPage: React.FC<RoomBuilderPageProps> = ({
             </button>
             <button
               className="rounded-xl border border-aqua-600/50 bg-aqua-600/10 backdrop-blur px-4 py-2.5 text-sm font-semibold text-aqua-100 shadow-lg transition-all hover:bg-aqua-600/20 hover:shadow-xl active:scale-95"
-              onClick={handleAutoZoom}
+              onClick={() => handleAutoZoom(selectedRoom)}
             >
               Auto Zoom
             </button>
@@ -1432,6 +1534,19 @@ export const RoomBuilderPage: React.FC<RoomBuilderPageProps> = ({
                             Device Icon
                           </span>
                         </label>
+                        <label className="flex items-center gap-2 cursor-pointer text-sm text-slate-200 hover:text-white transition-colors">
+                          <input
+                            type="checkbox"
+                            checked={showTargets}
+                            onChange={(e) => setShowTargets(e.target.checked)}
+                            className="w-4 h-4 rounded border-slate-600 bg-slate-800 text-blue-500 focus:ring-blue-500 focus:ring-offset-0"
+                          />
+                          <span className="flex items-center gap-1.5">
+                            <span className="w-3 h-3 rounded-full bg-blue-500"></span>
+                            Live Tracking
+                            {!liveState?.deviceId && <span className="text-slate-500 text-xs ml-1">(No device)</span>}
+                          </span>
+                        </label>
                       </div>
                     </div>
                   )}
@@ -1472,6 +1587,29 @@ export const RoomBuilderPage: React.FC<RoomBuilderPageProps> = ({
                     {v === 0 ? 'Off' : `${v}mm`}
                   </button>
                 ))}
+              </div>
+              <div className="flex items-center gap-3">
+                <span className="text-slate-400 font-medium">Wall Snap Angle:</span>
+                <button
+                  className={`rounded-lg border px-2.5 py-1 text-xs font-semibold transition-all active:scale-95 ${
+                    angleSnapEnabled
+                      ? 'border-aqua-500 bg-aqua-500/20 text-aqua-100 shadow-lg shadow-aqua-500/20'
+                      : 'border-slate-700 bg-slate-800/50 text-slate-200 hover:border-slate-600'
+                  }`}
+                  onClick={() => setAngleSnapEnabled(true)}
+                >
+                  45 deg
+                </button>
+                <button
+                  className={`rounded-lg border px-2.5 py-1 text-xs font-semibold transition-all active:scale-95 ${
+                    !angleSnapEnabled
+                      ? 'border-aqua-500 bg-aqua-500/20 text-aqua-100 shadow-lg shadow-aqua-500/20'
+                      : 'border-slate-700 bg-slate-800/50 text-slate-200 hover:border-slate-600'
+                  }`}
+                  onClick={() => setAngleSnapEnabled(false)}
+                >
+                  Free
+                </button>
               </div>
               <div className="flex items-center gap-3">
                 <span className="text-slate-400 font-medium">Units:</span>
@@ -1573,6 +1711,14 @@ export const RoomBuilderPage: React.FC<RoomBuilderPageProps> = ({
                                 }}
                               >
                                 Delete
+                              </button>
+                              <button
+                                className="rounded-md border border-emerald-500/70 px-2 py-1 text-xs font-semibold text-emerald-100 hover:bg-emerald-500/10"
+                                onClick={() => {
+                                  insertPointOnSegment(selectedSegment);
+                                }}
+                              >
+                                + Insert point
                               </button>
                               <div className="flex items-center gap-2 pt-1 text-xs text-slate-200">
                                 <span>Offset</span>

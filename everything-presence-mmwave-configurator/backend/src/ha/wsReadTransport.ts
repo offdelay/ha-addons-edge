@@ -9,6 +9,7 @@ import {
   DeviceRegistryEntry,
   AreaRegistryEntry,
   StateChangeCallback,
+  HaTarget,
 } from './readTransport';
 
 interface PendingRequest {
@@ -226,6 +227,43 @@ export class WsReadTransport implements IHaReadTransport {
     }
 
     logger.warn({ response }, 'WsReadTransport: Unexpected response when listing areas');
+    return [];
+  }
+
+  async getServicesForTarget(target: HaTarget, expandGroup: boolean = true): Promise<string[]> {
+    const response = (await this.call({
+      type: 'get_services_for_target',
+      target,
+      expand_group: expandGroup,
+    })) as HaWsMessage & { result?: string[] };
+
+    if (response.type === 'result' && (response as any).success) {
+      return (response as any).result ?? [];
+    }
+
+    logger.warn({ response }, 'WsReadTransport: Unexpected response when listing services for target');
+    return [];
+  }
+
+  async getServicesByDomain(domain: string): Promise<string[]> {
+    const response = (await this.call({
+      type: 'get_services',
+    })) as HaWsMessage & { result?: Record<string, Record<string, unknown>> };
+
+    if (response.type === 'result' && (response as any).success) {
+      const allServices = (response as any).result ?? {};
+      const domainServices: string[] = [];
+
+      if (allServices[domain]) {
+        for (const serviceName of Object.keys(allServices[domain])) {
+          domainServices.push(`${domain}.${serviceName}`);
+        }
+      }
+
+      return domainServices.sort();
+    }
+
+    logger.warn({ response, domain }, 'WsReadTransport: Unexpected response when listing services');
     return [];
   }
 

@@ -2,7 +2,6 @@ import React, { useEffect, useMemo, useState, useRef, useCallback } from 'react'
 import { fetchDevices, fetchProfiles, fetchZoneAvailability, ingressAware } from '../api/client';
 import { fetchRooms, updateRoom } from '../api/rooms';
 import { ZoneCanvas } from '../components/ZoneCanvas';
-import { ZoneEditor } from '../components/ZoneEditor';
 import {
   pushZonesToDevice,
   fetchZonesFromDevice,
@@ -13,6 +12,7 @@ import {
   PolygonModeStatus,
 } from '../api/zones';
 import { validateZones } from '../api/validate';
+import { getZoneLabels, saveZoneLabels } from '../api/deviceMappings';
 import { DiscoveredDevice, DeviceProfile, RoomConfig, ZoneRect, ZonePolygon, LiveState, ZoneAvailability } from '../api/types';
 import { useDisplaySettings } from '../hooks/useDisplaySettings';
 import { useDeviceMappings } from '../contexts/DeviceMappingsContext';
@@ -67,10 +67,16 @@ export const ZoneEditorPage: React.FC<ZoneEditorPageProps> = ({
   const [showSettings, setShowSettings] = useState(false);
   const [showNavMenu, setShowNavMenu] = useState(false);
   // Polygon mode state
-  const [polygonModeStatus, setPolygonModeStatus] = useState<PolygonModeStatus>({ supported: false, enabled: false });
+  const [polygonModeStatus, setPolygonModeStatus] = useState<PolygonModeStatus>({
+    supported: false,
+    enabled: false,
+    controllable: false,
+  });
   const [polygonZones, setPolygonZones] = useState<ZonePolygon[]>([]);
   const [togglingPolygonMode, setTogglingPolygonMode] = useState(false);
   const [showModeChangeConfirm, setShowModeChangeConfirm] = useState(false);
+  // Zone labels from device mapping (stored separately from zone coordinates)
+  const [deviceZoneLabels, setDeviceZoneLabels] = useState<Record<string, string>>({});
   // Display settings (persisted to localStorage)
   const {
     showWalls, setShowWalls,
@@ -78,6 +84,7 @@ export const ZoneEditorPage: React.FC<ZoneEditorPageProps> = ({
     showDoors, setShowDoors,
     showZones, setShowZones,
     showDeviceIcon, setShowDeviceIcon,
+    showTargets, setShowTargets,
     clipRadarToWalls,
   } = useDisplaySettings();
   const liveState = propLiveState;
@@ -103,7 +110,7 @@ export const ZoneEditorPage: React.FC<ZoneEditorPageProps> = ({
   );
 
   // Device mappings context - used to check if device has valid entity mappings
-  const { hasValidMappings } = useDeviceMappings();
+  const { hasValidMappings, clearCache } = useDeviceMappings();
   const deviceHasValidMappings = selectedRoom?.deviceId ? hasValidMappings(selectedRoom.deviceId) : false;
 
   // Generate all possible zone slots based on profile limits
@@ -154,7 +161,7 @@ export const ZoneEditorPage: React.FC<ZoneEditorPageProps> = ({
     return zones;
   }, [selectedProfile]);
 
-  // Merge device zones with all possible zones
+  // Merge device zones with all possible zones, applying labels from device mapping
   const displayZones = useMemo(() => {
     if (!selectedRoom) return allPossibleZones;
 
@@ -164,12 +171,14 @@ export const ZoneEditorPage: React.FC<ZoneEditorPageProps> = ({
     return allPossibleZones.map(slot => {
       const deviceZone = deviceZones.find(z => z.id === slot.id && z.type === slot.type);
       if (deviceZone) {
-        return { ...slot, ...deviceZone, enabled: true };
+        // Apply label from device mapping (stored separately from coordinates)
+        const label = deviceZoneLabels[slot.id] ?? deviceZone.label;
+        return { ...slot, ...deviceZone, label, enabled: true };
       }
       // Return a fresh copy with enabled: false to ensure clean state
       return { ...slot, enabled: false };
     });
-  }, [selectedRoom, allPossibleZones]);
+  }, [selectedRoom, allPossibleZones, deviceZoneLabels]);
 
   // Only enabled zones should show on canvas
   const enabledZones = useMemo(() => {
@@ -196,14 +205,6 @@ export const ZoneEditorPage: React.FC<ZoneEditorPageProps> = ({
     return true;
   };
 
-  // Get why a zone is disabled
-  const getDisabledReason = (zone: ZoneRect): string | null => {
-    const key = getAvailabilityKey(zone.id, zone.type);
-    const availability = zoneAvailability[key];
-    if (!availability || availability.status !== 'disabled') return null;
-    return availability.disabledBy ?? 'unknown';
-  };
-
   const getZoneStatus = (zone: ZoneRect): 'enabled' | 'disabled' | 'unavailable' | 'unknown' => {
     const key = getAvailabilityKey(zone.id, zone.type);
     const availability = zoneAvailability[key];
@@ -214,6 +215,8 @@ export const ZoneEditorPage: React.FC<ZoneEditorPageProps> = ({
     const availability = polygonAvailability[zoneId];
     return availability?.status ?? 'unknown';
   };
+
+  const polygonModeControllable = polygonModeStatus.controllable !== false;
 
   useEffect(() => {
     if (!warning) return;
@@ -250,7 +253,8 @@ export const ZoneEditorPage: React.FC<ZoneEditorPageProps> = ({
       }
     };
     load();
-  }, [initialProfileId, initialRoomId, selectedProfileId, selectedRoomId]);
+    // Note: selectedRoomId and selectedProfileId intentionally excluded - this is initialization only.
+  }, [initialProfileId, initialRoomId]);
 
   useEffect(() => {
     // Only run when room ID actually changes (not on every render)
@@ -268,6 +272,26 @@ export const ZoneEditorPage: React.FC<ZoneEditorPageProps> = ({
       setPanOffsetMm({ x: 0, y: 0 });
     }
   }, [selectedRoom?.id]);
+
+  // Load zone labels from device mapping when device changes
+  useEffect(() => {
+    const loadDeviceZoneLabels = async () => {
+      if (!selectedRoom?.deviceId) {
+        setDeviceZoneLabels({});
+        return;
+      }
+
+      try {
+        const labels = await getZoneLabels(selectedRoom.deviceId);
+        setDeviceZoneLabels(labels);
+      } catch (err) {
+        // Silently fail - labels are optional
+        setDeviceZoneLabels({});
+      }
+    };
+
+    loadDeviceZoneLabels();
+  }, [selectedRoom?.deviceId]);
 
   // Fetch existing zones from device when room is loaded
   useEffect(() => {
@@ -304,23 +328,19 @@ export const ZoneEditorPage: React.FC<ZoneEditorPageProps> = ({
           entityMappingsToUse
         );
 
-        // Preserve labels from existing zones (labels are UI-only, not stored on device)
-        const existingZones = selectedRoom.zones ?? [];
-        const mergedZones = deviceZones.map(deviceZone => {
-          const existingZone = existingZones.find(z => z.id === deviceZone.id);
-          return existingZone?.label ? { ...deviceZone, label: existingZone.label } : deviceZone;
-        });
+        // Device zones contain coordinates only - labels are stored separately in device mapping
+        // No need to merge labels here, they're loaded from device mapping via getZoneLabels
 
         // Always sync device zones to local storage (device is source of truth for coordinates)
-        const updatedRoom = { ...selectedRoom, zones: mergedZones };
+        const updatedRoom = { ...selectedRoom, zones: deviceZones };
 
         // Update local state
         setRooms((prev) => prev.map((r) =>
           r.id === selectedRoom.id ? updatedRoom : r
         ));
 
-        // Persist to add-on storage to keep it in sync with device (including labels)
-        await updateRoom(selectedRoom.id, { zones: mergedZones });
+        // Persist to add-on storage to keep it in sync with device (coordinates only, labels in device mapping)
+        await updateRoom(selectedRoom.id, { zones: deviceZones });
 
         // Only set selection if no zone is currently selected
         if (deviceZones.length > 0 && !selectedZoneId) {
@@ -386,7 +406,7 @@ export const ZoneEditorPage: React.FC<ZoneEditorPageProps> = ({
   useEffect(() => {
     const loadPolygonModeStatus = async () => {
       if (!selectedRoom?.deviceId || !selectedRoom?.profileId) {
-        setPolygonModeStatus({ supported: false, enabled: false });
+        setPolygonModeStatus({ supported: false, enabled: false, controllable: false });
         return;
       }
 
@@ -397,7 +417,7 @@ export const ZoneEditorPage: React.FC<ZoneEditorPageProps> = ({
       }
 
       if (!entityNamePrefix) {
-        setPolygonModeStatus({ supported: false, enabled: false });
+        setPolygonModeStatus({ supported: false, enabled: false, controllable: false });
         return;
       }
 
@@ -412,7 +432,7 @@ export const ZoneEditorPage: React.FC<ZoneEditorPageProps> = ({
         );
         setPolygonModeStatus(status);
       } catch (err) {
-        setPolygonModeStatus({ supported: false, enabled: false });
+        setPolygonModeStatus({ supported: false, enabled: false, controllable: false });
       }
     };
 
@@ -488,6 +508,15 @@ export const ZoneEditorPage: React.FC<ZoneEditorPageProps> = ({
     if (nextZones.length && !selectedZoneId) {
       setSelectedZoneId(nextZones[0].id);
     }
+
+    // Update local label state for immediate UI feedback (persisted on save)
+    const newLabels: Record<string, string> = {};
+    for (const zone of nextZones) {
+      if (zone.label) {
+        newLabels[zone.id] = zone.label;
+      }
+    }
+    setDeviceZoneLabels(newLabels);
   };
 
   const handlePolygonZonesChange = (nextZones: ZonePolygon[]) => {
@@ -742,10 +771,37 @@ export const ZoneEditorPage: React.FC<ZoneEditorPageProps> = ({
         }
       }
 
-      // Always save to add-on storage (rectangle zones only - polygon zones are device-only)
+      // Save to add-on storage (rectangle zones only - polygon zones are device-only)
       if (!polygonModeStatus.enabled) {
         const result = await updateRoom(selectedRoom.id, selectedRoom);
         setRooms((prev) => prev.map((r) => (r.id === selectedRoom.id ? result.room : r)));
+      }
+
+      // Save zone labels to device mapping (for both rectangle and polygon zones)
+      if (selectedRoom.deviceId) {
+        const labelsToSave: Record<string, string> = {};
+        if (polygonModeStatus.enabled) {
+          // Polygon zones - get labels from polygonZones state and deviceZoneLabels
+          for (const zone of polygonZones) {
+            const label = deviceZoneLabels[zone.id] || zone.label;
+            if (label) {
+              labelsToSave[zone.id] = label;
+            }
+          }
+        } else {
+          // Rectangle zones - get labels from room zones
+          for (const zone of selectedRoom.zones ?? []) {
+            if (zone.label) {
+              labelsToSave[zone.id] = zone.label;
+            }
+          }
+        }
+        const savedLabels = await saveZoneLabels(selectedRoom.deviceId, labelsToSave);
+        if (savedLabels) {
+          setDeviceZoneLabels(savedLabels);
+          // Invalidate the device mapping cache so other pages get fresh labels
+          clearCache(selectedRoom.deviceId);
+        }
       }
 
       onWizardZonesReady?.();
@@ -962,7 +1018,7 @@ export const ZoneEditorPage: React.FC<ZoneEditorPageProps> = ({
       )}
 
       {/* Floating Action Button (top right) */}
-      <div className="absolute top-6 right-6 z-40">
+      <div className="absolute top-6 right-6 z-40 flex flex-col items-end gap-2">
         <button
           onClick={handleSaveZones}
           disabled={saving}
@@ -973,6 +1029,14 @@ export const ZoneEditorPage: React.FC<ZoneEditorPageProps> = ({
           )}
           {saving ? 'Saving Zones...' : 'Save Zones'}
         </button>
+        {onNavigate && (
+          <button
+            onClick={() => onNavigate('settings')}
+            className="rounded-xl border border-slate-700/60 bg-slate-900/90 px-4 py-2 text-xs font-semibold text-slate-200 shadow-lg transition-all hover:border-slate-600 hover:bg-slate-800 active:scale-95"
+          >
+            Zone Backups
+          </button>
+        )}
       </div>
 
       {/* Canvas Content - Full Page */}
@@ -992,6 +1056,19 @@ export const ZoneEditorPage: React.FC<ZoneEditorPageProps> = ({
         <div
           className="h-full w-full overflow-hidden overscroll-contain touch-none"
           onWheelCapture={(e) => {
+            // Check if the event target is within a scrollable container (like zone slots panel)
+            // If so, let the native scroll happen instead of zooming
+            let target = e.target as HTMLElement | null;
+            while (target && target !== e.currentTarget) {
+              const style = window.getComputedStyle(target);
+              const overflowY = style.overflowY;
+              if (overflowY === 'auto' || overflowY === 'scroll') {
+                // Target is in a scrollable container, don't zoom
+                return;
+              }
+              target = target.parentElement;
+            }
+
             if (e.cancelable) e.preventDefault();
             if ((e.nativeEvent as any)?.cancelable) {
               (e.nativeEvent as any).preventDefault();
@@ -1031,6 +1108,7 @@ export const ZoneEditorPage: React.FC<ZoneEditorPageProps> = ({
             floorMaterial={selectedRoom.floorMaterial}
             furniture={selectedRoom.furniture ?? []}
             doors={selectedRoom.doors ?? []}
+            zoneLabels={deviceZoneLabels}
             devicePlacement={selectedRoom.devicePlacement}
             installationAngle={installationAngle}
             fieldOfViewDeg={selectedProfile?.limits?.fieldOfViewDegrees}
@@ -1051,10 +1129,10 @@ export const ZoneEditorPage: React.FC<ZoneEditorPageProps> = ({
                 { fill: '#f59e0b', fillOpacity: 'rgba(245, 158, 11, 0.2)', name: 'Amber' },     // Target 3 - Amber
               ];
 
-              // Render live target positions
-              if (targetPositions.length > 0) {
+              // Render live target positions (pointer-events: none so they don't block zone interaction)
+              if (showTargets && targetPositions.length > 0) {
                 return (
-                  <g>
+                  <g style={{ pointerEvents: 'none' }}>
                     {targetPositions.map((target) => {
                       const canvasPos = toCanvas({ x: target.x, y: target.y });
                       const cx = canvasPos.x;
@@ -1138,7 +1216,7 @@ export const ZoneEditorPage: React.FC<ZoneEditorPageProps> = ({
             </button>
 
             {/* Polygon Mode Toggle (only show if supported by profile AND device has the entities) */}
-            {polygonModeStatus.supported && (
+            {polygonModeStatus.supported && polygonModeControllable && (
               <button
                 className={`rounded-xl border backdrop-blur px-6 py-3 text-sm font-semibold shadow-lg transition-all hover:shadow-xl active:scale-95 ${
                   polygonModeStatus.enabled
@@ -1164,6 +1242,11 @@ export const ZoneEditorPage: React.FC<ZoneEditorPageProps> = ({
                   </>
                 )}
               </button>
+            )}
+            {polygonModeStatus.supported && !polygonModeControllable && (
+              <div className="rounded-xl border border-violet-500/40 bg-violet-600/10 px-6 py-3 text-sm font-semibold text-violet-100 shadow-lg">
+                Polygon mode active
+              </div>
             )}
 
           </div>
@@ -1275,6 +1358,18 @@ export const ZoneEditorPage: React.FC<ZoneEditorPageProps> = ({
                     <span className="flex items-center gap-1.5">
                       <span className="w-3 h-3 rounded-full bg-green-500"></span>
                       Device Icon
+                    </span>
+                  </label>
+                  <label className="flex items-center gap-2 cursor-pointer text-sm text-slate-200 hover:text-white transition-colors">
+                    <input
+                      type="checkbox"
+                      checked={showTargets}
+                      onChange={(e) => setShowTargets(e.target.checked)}
+                      className="w-4 h-4 rounded border-slate-600 bg-slate-800 text-cyan-500 focus:ring-cyan-500 focus:ring-offset-0"
+                    />
+                    <span className="flex items-center gap-1.5">
+                      <span className="w-3 h-3 rounded-full bg-cyan-500"></span>
+                      Targets
                     </span>
                   </label>
                 </div>
@@ -1418,9 +1513,9 @@ export const ZoneEditorPage: React.FC<ZoneEditorPageProps> = ({
                                 polygon.type === 'regular' ? 'text-blue-100' :
                                 polygon.type === 'exclusion' ? 'text-rose-100' : 'text-emerald-100'
                               }`}>
-                                {polygon.label || polygon.id}
+                                {deviceZoneLabels[polygon.id] || polygon.label || polygon.id}
                               </span>
-                              {polygon.label && (
+                              {(deviceZoneLabels[polygon.id] || polygon.label) && (
                                 <span className="text-xs text-slate-500">({polygon.id})</span>
                               )}
                               {polygonStatus === 'disabled' && (
@@ -1461,6 +1556,37 @@ export const ZoneEditorPage: React.FC<ZoneEditorPageProps> = ({
                               Delete
                             </button>
                           </div>
+                          {/* Zone Name Input */}
+                          <div className="mb-2">
+                            <input
+                              type="text"
+                              placeholder="Zone name (e.g. Bed, Desk...)"
+                              className={`w-full rounded-md border px-2 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none ${
+                                polygon.type === 'regular'
+                                  ? 'border-blue-600/50 bg-blue-950/50 focus:border-blue-400'
+                                  : polygon.type === 'exclusion'
+                                  ? 'border-rose-600/50 bg-rose-950/50 focus:border-rose-400'
+                                  : 'border-emerald-600/50 bg-emerald-950/50 focus:border-emerald-400'
+                              }`}
+                              value={deviceZoneLabels[polygon.id] ?? polygon.label ?? ''}
+                              onClick={(e) => e.stopPropagation()}
+                              onChange={(e) => {
+                                const newLabel = e.target.value || undefined;
+                                // Update both local polygon state and deviceZoneLabels
+                                const updated = { ...polygon, label: newLabel };
+                                setPolygonZones(polygonZones.map(z => z.id === polygon.id ? updated : z));
+                                setDeviceZoneLabels(prev => {
+                                  const next = { ...prev };
+                                  if (newLabel) {
+                                    next[polygon.id] = newLabel;
+                                  } else {
+                                    delete next[polygon.id];
+                                  }
+                                  return next;
+                                });
+                              }}
+                            />
+                          </div>
                           {/* Vertex info */}
                           <div className="text-[10px] text-slate-400 font-mono">
                             {polygon.vertices.slice(0, 3).map((v, i) => (
@@ -1474,114 +1600,139 @@ export const ZoneEditorPage: React.FC<ZoneEditorPageProps> = ({
                   )}
                 </div>
               ) : (
-                /* Rectangle Mode Zone List */
+                /* Rectangle Mode Zone List - Matching Polygon UI Style */
                 <div className="p-4 space-y-3">
-                  {displayZones.map((zone) => {
-                    const available = isZoneAvailable(zone);
-                    const status = getZoneStatus(zone);
-                    const disabledReason = getDisabledReason(zone);
+                  {/* Add Zone Buttons */}
+                  <div className="flex flex-wrap gap-2 pb-3 border-b border-slate-700/50">
+                    {(() => {
+                      const regularSlots = displayZones.filter(z => z.type === 'regular' && isZoneAvailable(z));
+                      const enabledRegular = regularSlots.filter(z => z.enabled).length;
+                      const nextRegularSlot = regularSlots.find(z => !z.enabled);
+                      return (
+                        <button
+                          onClick={() => nextRegularSlot && enableZoneSlot(nextRegularSlot.id)}
+                          disabled={!nextRegularSlot}
+                          className="flex-1 rounded-lg border border-blue-500/50 bg-blue-600/20 px-3 py-2 text-xs font-semibold text-blue-100 transition-all hover:bg-blue-600/30 disabled:opacity-40 disabled:cursor-not-allowed"
+                        >
+                          + Zone ({enabledRegular}/{regularSlots.length})
+                        </button>
+                      );
+                    })()}
+                    {(() => {
+                      const exclusionSlots = displayZones.filter(z => z.type === 'exclusion' && isZoneAvailable(z));
+                      const enabledExclusion = exclusionSlots.filter(z => z.enabled).length;
+                      const nextExclusionSlot = exclusionSlots.find(z => !z.enabled);
+                      return (
+                        <button
+                          onClick={() => nextExclusionSlot && enableZoneSlot(nextExclusionSlot.id)}
+                          disabled={!nextExclusionSlot}
+                          className="flex-1 rounded-lg border border-rose-500/50 bg-rose-600/20 px-3 py-2 text-xs font-semibold text-rose-100 transition-all hover:bg-rose-600/30 disabled:opacity-40 disabled:cursor-not-allowed"
+                        >
+                          + Exclusion ({enabledExclusion}/{exclusionSlots.length})
+                        </button>
+                      );
+                    })()}
+                    {(() => {
+                      const entrySlots = displayZones.filter(z => z.type === 'entry' && isZoneAvailable(z));
+                      const enabledEntry = entrySlots.filter(z => z.enabled).length;
+                      const nextEntrySlot = entrySlots.find(z => !z.enabled);
+                      return (
+                        <button
+                          onClick={() => nextEntrySlot && enableZoneSlot(nextEntrySlot.id)}
+                          disabled={!nextEntrySlot}
+                          className="flex-1 rounded-lg border border-emerald-500/50 bg-emerald-600/20 px-3 py-2 text-xs font-semibold text-emerald-100 transition-all hover:bg-emerald-600/30 disabled:opacity-40 disabled:cursor-not-allowed"
+                        >
+                          + Entry ({enabledEntry}/{entrySlots.length})
+                        </button>
+                      );
+                    })()}
+                  </div>
 
-                    return (
-                      <div
-                        key={zone.id}
-                        className={`rounded-lg border ${
-                          !available
-                            ? 'border-slate-600/50 bg-slate-800/20 opacity-60'
-                            : zone.enabled
-                            ? zone.type === 'regular'
-                              ? 'border-aqua-600/50 bg-aqua-600/10'
+                  {/* Rectangle Zone List - Only show enabled zones */}
+                  {enabledZones.length === 0 ? (
+                    <div className="text-center py-8 text-slate-400 text-sm">
+                      No zones configured.<br />
+                      Use the buttons above to add zones.
+                    </div>
+                  ) : (
+                    enabledZones.map((zone) => {
+                      const isSelected = selectedZoneId === zone.id;
+                      const status = getZoneStatus(zone);
+                      return (
+                        <div
+                          key={zone.id}
+                          onClick={() => setSelectedZoneId(zone.id)}
+                          className={`rounded-lg border p-3 transition-all cursor-pointer ${
+                            zone.type === 'regular'
+                              ? isSelected ? 'border-blue-500 bg-blue-600/20' : 'border-blue-600/50 bg-blue-600/10 hover:bg-blue-600/15'
                               : zone.type === 'exclusion'
-                              ? 'border-rose-600/50 bg-rose-600/10'
-                              : 'border-amber-600/50 bg-amber-600/10'
-                            : 'border-slate-700 bg-slate-800/30'
-                        } p-3 transition-all`}
-                        title={
-                          status === 'disabled'
-                            ? `Entity disabled in Home Assistant (by ${disabledReason}). Enable the entity in HA to use this zone.`
-                            : status === 'unavailable'
-                            ? 'Entity is currently unavailable in Home Assistant. Check the device connection.'
-                            : status === 'unknown'
-                            ? 'Zone entity status is unknown. Try reloading to refresh availability.'
-                            : undefined
-                        }
-                      >
-                        <div className="flex items-center justify-between mb-2">
-                          <div className="flex items-center gap-2">
-                            <span className={`text-sm font-bold ${!available ? 'text-slate-500' : zone.enabled ? 'text-white' : 'text-slate-400'}`}>
-                              {zone.label || zone.id}
-                            </span>
-                            {zone.label && (
-                              <span className="text-xs text-slate-500">({zone.id})</span>
-                            )}
-                            {status === 'disabled' && (
-                              <span className="text-xs text-amber-400 bg-amber-500/10 px-2 py-0.5 rounded">
-                                Entity Disabled
+                              ? isSelected ? 'border-rose-500 bg-rose-600/20' : 'border-rose-600/50 bg-rose-600/10 hover:bg-rose-600/15'
+                              : isSelected ? 'border-emerald-500 bg-emerald-600/20' : 'border-emerald-600/50 bg-emerald-600/10 hover:bg-emerald-600/15'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between mb-2">
+                            <div className="flex items-center gap-2">
+                              <span className={`text-sm font-bold ${
+                                zone.type === 'regular' ? 'text-blue-100' :
+                                zone.type === 'exclusion' ? 'text-rose-100' : 'text-emerald-100'
+                              }`}>
+                                {zone.label || zone.id}
                               </span>
-                            )}
-                            {status === 'unavailable' && (
-                              <span className="text-xs text-sky-300 bg-sky-500/10 px-2 py-0.5 rounded">
-                                Entity Unavailable
-                              </span>
-                            )}
-                            {available && !zone.enabled && (
-                              <span className="text-xs text-slate-500">(Inactive)</span>
-                            )}
-                          </div>
-                          {available ? (
+                              {zone.label && (
+                                <span className="text-xs text-slate-500">({zone.id})</span>
+                              )}
+                              {status === 'disabled' && (
+                                <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-200">
+                                  Disabled
+                                </span>
+                              )}
+                              {status === 'unavailable' && (
+                                <span className="text-[10px] px-1.5 py-0.5 rounded bg-sky-500/20 text-sky-200">
+                                  Unavailable
+                                </span>
+                              )}
+                            </div>
                             <button
-                              onClick={() => {
-                                if (zone.enabled) {
-                                  disableZoneSlot(zone.id);
-                                } else {
-                                  enableZoneSlot(zone.id);
-                                }
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                disableZoneSlot(zone.id);
                               }}
-                              className={`rounded-lg px-3 py-1 text-xs font-semibold transition-all ${
-                                zone.enabled
-                                  ? 'border border-slate-600 bg-slate-700 text-slate-200 hover:bg-slate-600'
-                                  : 'border border-emerald-600 bg-emerald-600/20 text-emerald-100 hover:bg-emerald-600/30'
-                              }`}
+                              className="rounded-lg border border-slate-600 bg-slate-700/50 px-2 py-1 text-xs text-slate-300 transition-all hover:bg-rose-600/30 hover:border-rose-500 hover:text-rose-200"
                             >
-                              {zone.enabled ? 'Disable' : 'Enable'}
+                              Delete
                             </button>
-                          ) : (
-                            <span className="text-xs text-slate-500 italic">
-                              {status === 'unavailable' ? 'Unavailable' : 'Enable in HA'}
-                            </span>
-                          )}
+                          </div>
+                          {/* Zone Name Input */}
+                          <div className="mb-2">
+                            <input
+                              type="text"
+                              placeholder="Zone name (e.g. Bed, Desk...)"
+                              className={`w-full rounded-md border px-2 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none ${
+                                zone.type === 'regular'
+                                  ? 'border-blue-600/50 bg-blue-950/50 focus:border-blue-400'
+                                  : zone.type === 'exclusion'
+                                  ? 'border-rose-600/50 bg-rose-950/50 focus:border-rose-400'
+                                  : 'border-emerald-600/50 bg-emerald-950/50 focus:border-emerald-400'
+                              }`}
+                              value={zone.label ?? ''}
+                              onClick={(e) => e.stopPropagation()}
+                              onChange={(e) => {
+                                const updated = { ...zone, label: e.target.value || undefined };
+                                const newDisplayZones = displayZones.map((z) =>
+                                  z.id === updated.id ? { ...updated, enabled: true } : z
+                                );
+                                handleZonesChange(newDisplayZones.filter(z => z.enabled));
+                              }}
+                            />
+                          </div>
+                          {/* Coordinate info */}
+                          <div className="text-[10px] text-slate-400 font-mono">
+                            x: {(zone.x / 1000).toFixed(2)}m, y: {(zone.y / 1000).toFixed(2)}m, w: {(zone.width / 1000).toFixed(2)}m, h: {(zone.height / 1000).toFixed(2)}m
+                          </div>
                         </div>
-                        {!available && status === 'disabled' && (
-                          <div className="text-xs text-slate-400 mb-2">
-                            Enable the zone entity in Home Assistant to configure this zone.
-                          </div>
-                        )}
-                        {!available && status === 'unavailable' && (
-                          <div className="text-xs text-slate-400 mb-2">
-                            Entity is unavailable. Restore device connectivity to edit this zone.
-                          </div>
-                        )}
-                        {available && zone.enabled && (
-                          <ZoneEditor
-                            key={zone.id}
-                            zone={zone}
-                            onChange={(updated) => {
-                              const newDisplayZones = displayZones.map((z) =>
-                                z.id === updated.id ? { ...updated, enabled: true } : z
-                              );
-                              handleZonesChange(newDisplayZones.filter(z => z.enabled));
-                            }}
-                            onDelete={(id) => {
-                              const remainingZones = displayZones.filter(z => z.enabled && z.id !== id);
-                              handleZonesChange(remainingZones);
-                              if (selectedZoneId === id) {
-                                setSelectedZoneId(remainingZones[0]?.id ?? null);
-                              }
-                            }}
-                          />
-                        )}
-                      </div>
-                    );
-                  })}
+                      );
+                    })
+                  )}
                 </div>
               )}
             </div>

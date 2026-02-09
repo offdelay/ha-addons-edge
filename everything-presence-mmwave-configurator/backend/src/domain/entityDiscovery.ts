@@ -1,5 +1,6 @@
 import type { IHaReadTransport } from '../ha/readTransport';
 import type { EntityRegistryEntry } from '../ha/types';
+import type { DeviceRegistryEntry } from '../ha/readTransport';
 import type { DeviceProfileLoader } from './deviceProfiles';
 import type { EntityMappings, ZoneEntitySet, TargetEntitySet } from './types';
 import { deviceMappingStorage, DeviceMapping, parseFirmwareVersion } from '../config/deviceMappingStorage';
@@ -62,6 +63,8 @@ export interface DiscoveryResult {
   results: EntityMatchResult[];
   suggestedMappings: Partial<EntityMappings>;
   deviceEntities: EntityRegistryEntry[];  // All entities for this device
+  /** Auto-discovered ESPHome services (if any), e.g. getBuildFlags */
+  serviceMappings?: Record<string, string>;
 }
 
 /**
@@ -97,6 +100,48 @@ export class EntityDiscoveryService {
     const deviceEntities = await this.getDeviceEntities(deviceId);
     logger.info({ deviceId, entityCount: deviceEntities.length }, 'Found device entities');
 
+    // Attempt ESPHome service discovery in parallel with entity discovery.
+    // This mirrors the entity auto-match flow: try to find services now,
+    // but don't persist until the user saves.
+    let serviceMappings: Record<string, string> | undefined;
+    try {
+      const existingMapping = deviceMappingStorage.getMapping(deviceId);
+      let esphomeNodeName = existingMapping?.esphomeNodeName;
+      if (!esphomeNodeName) {
+        try {
+          const devices = await this.readTransport.listDevices();
+          const device = devices.find(d => d.id === deviceId);
+          if (device) {
+            esphomeNodeName = this.extractEsphomeNodeName(device);
+          }
+        } catch (err) {
+          logger.warn({ err, deviceId }, 'Failed to fetch device info for service discovery, continuing without it');
+        }
+      }
+
+      const discoveredBuildFlags = await this.discoverServiceBySuffix(
+        deviceId,
+        esphomeNodeName,
+        '_get_build_flags',
+        'getBuildFlags'
+      );
+      const discoveredUpdateManifest = await this.discoverServiceBySuffix(
+        deviceId,
+        esphomeNodeName,
+        '_set_update_manifest',
+        'setUpdateManifest'
+      );
+
+      if (discoveredBuildFlags || discoveredUpdateManifest) {
+        serviceMappings = {
+          ...(discoveredBuildFlags ? { getBuildFlags: discoveredBuildFlags } : {}),
+          ...(discoveredUpdateManifest ? { setUpdateManifest: discoveredUpdateManifest } : {}),
+        };
+      }
+    } catch (err) {
+      logger.warn({ err, deviceId }, 'Service discovery failed during entity discovery');
+    }
+
     if (deviceEntities.length === 0) {
       logger.warn({ deviceId }, 'No entities found for device');
       return {
@@ -113,6 +158,7 @@ export class EntityDiscoveryService {
           manuallyMappedCount: 0,
         },
         deviceEntities,
+        serviceMappings,
       };
     }
 
@@ -172,6 +218,7 @@ export class EntityDiscoveryService {
       results,
       suggestedMappings,
       deviceEntities,
+      serviceMappings,
     };
 
     if (unmatchedRequired > 0) {
@@ -293,13 +340,14 @@ export class EntityDiscoveryService {
       const entityIdLower = entity.entity_id.toLowerCase();
 
       // Filter by zone type to avoid cross-matching entry/regular/exclusion
-      if (isRegularZoneTemplate && (entityIdLower.includes('entry_zone_') || entityIdLower.includes('occupancy_mask_'))) {
+      // EPL uses occupancy_mask_ for exclusion zones, EPP uses exclusion_zone_
+      if (isRegularZoneTemplate && (entityIdLower.includes('entry_zone_') || entityIdLower.includes('occupancy_mask_') || entityIdLower.includes('exclusion_zone_'))) {
         return { score: -1, confidence: 'none' };
       }
       if (isEntryZoneTemplate && !entityIdLower.includes('entry_zone_')) {
         return { score: -1, confidence: 'none' };
       }
-      if (isExclusionZoneTemplate && !entityIdLower.includes('occupancy_mask_')) {
+      if (isExclusionZoneTemplate && !(entityIdLower.includes('occupancy_mask_') || entityIdLower.includes('exclusion_zone_'))) {
         return { score: -1, confidence: 'none' };
       }
 
@@ -827,7 +875,7 @@ export class EntityDiscoveryService {
       'humidityEntity', 'illuminanceEntity', 'co2Entity', 'distanceEntity',
       'speedEntity', 'energyEntity', 'targetCountEntity', 'modeEntity',
       'maxDistanceEntity', 'installationAngleEntity', 'polygonZonesEnabledEntity',
-      'trackingTargetCountEntity',
+      'trackingTargetCountEntity', 'firmwareUpdateEntity', 'assumedPresentEntity', 'assumedPresentRemainingEntity',
     ];
 
     for (const key of flatKeys) {
@@ -902,6 +950,15 @@ export class EntityDiscoveryService {
     // Convert suggestedMappings (nested EntityMappings) to flat format
     const flatMappings = normalizeMappingKeys(this.convertToFlatMappings(discovery.suggestedMappings));
 
+    const entityOriginalObjectIds = this.mapOriginalObjectIds(
+      flatMappings,
+      discovery.deviceEntities
+    );
+    const entityUniqueIds = this.mapUniqueIds(
+      flatMappings,
+      discovery.deviceEntities
+    );
+
     // Fetch unit_of_measurement for tracking entities (x/y coordinates)
     const entityUnits = await this.fetchEntityUnits(flatMappings);
 
@@ -909,6 +966,7 @@ export class EntityDiscoveryService {
     let rawSwVersion: string | undefined;
     let firmwareVersion: string | undefined;
     let esphomeVersion: string | undefined;
+    let esphomeNodeName: string | undefined;
     try {
       const devices = await this.readTransport.listDevices();
       const device = devices.find(d => d.id === deviceId);
@@ -919,8 +977,33 @@ export class EntityDiscoveryService {
         esphomeVersion = parsed.esphomeVersion;
       logger.debug({ deviceId, rawSwVersion, firmwareVersion, esphomeVersion }, 'Parsed firmware version');
       }
+      if (device) {
+        esphomeNodeName = this.extractEsphomeNodeName(device);
+      }
     } catch (err) {
       logger.warn({ err, deviceId }, 'Failed to fetch device firmware version, continuing without it');
+    }
+
+    // Auto-discover ESPHome service mappings (e.g., getBuildFlags, setUpdateManifest)
+    let serviceMappings: Record<string, string> | undefined;
+    const discoveredBuildFlags = await this.discoverServiceBySuffix(
+      deviceId,
+      esphomeNodeName,
+      '_get_build_flags',
+      'getBuildFlags'
+    );
+    const discoveredUpdateManifest = await this.discoverServiceBySuffix(
+      deviceId,
+      esphomeNodeName,
+      '_set_update_manifest',
+      'setUpdateManifest'
+    );
+
+    if (discoveredBuildFlags || discoveredUpdateManifest) {
+      serviceMappings = {
+        ...(discoveredBuildFlags ? { getBuildFlags: discoveredBuildFlags } : {}),
+        ...(discoveredUpdateManifest ? { setUpdateManifest: discoveredUpdateManifest } : {}),
+      };
     }
 
     // Build DeviceMapping object
@@ -928,6 +1011,7 @@ export class EntityDiscoveryService {
       deviceId,
       profileId,
       deviceName,
+      esphomeNodeName,
       discoveredAt: new Date().toISOString(),
       lastUpdated: new Date().toISOString(),
       confirmedByUser: false, // Not yet confirmed by user
@@ -937,11 +1021,14 @@ export class EntityDiscoveryService {
       unmappedEntities: discovery.results
         .filter(r => r.matchedEntityId === null && !r.isOptional)
         .map(r => r.templateKey),
+      entityOriginalObjectIds: Object.keys(entityOriginalObjectIds).length > 0 ? entityOriginalObjectIds : undefined,
+      entityUniqueIds: Object.keys(entityUniqueIds).length > 0 ? entityUniqueIds : undefined,
       entityUnits,
       firmwareVersion,
       esphomeVersion,
       rawSwVersion,
       profileSchemaVersion,
+      serviceMappings,
     };
 
     // Save to device storage
@@ -1009,6 +1096,62 @@ export class EntityDiscoveryService {
     return entityUnits;
   }
 
+  private mapOriginalObjectIds(
+    flatMappings: Record<string, string>,
+    deviceEntities: EntityRegistryEntry[]
+  ): Record<string, string> {
+    const originalObjectIds: Record<string, string> = {};
+    const registryById = new Map(deviceEntities.map((entity) => [entity.entity_id, entity]));
+
+    for (const entityId of Object.values(flatMappings)) {
+      if (!entityId) continue;
+      const entry = registryById.get(entityId);
+      const originalObjectId = entry?.original_object_id;
+      if (originalObjectId) {
+        originalObjectIds[entityId] = originalObjectId;
+      }
+    }
+
+    return originalObjectIds;
+  }
+
+  private mapUniqueIds(
+    flatMappings: Record<string, string>,
+    deviceEntities: EntityRegistryEntry[]
+  ): Record<string, string> {
+    const uniqueIds: Record<string, string> = {};
+    const registryById = new Map(deviceEntities.map((entity) => [entity.entity_id, entity]));
+
+    for (const entityId of Object.values(flatMappings)) {
+      if (!entityId) continue;
+      const entry = registryById.get(entityId);
+      const uniqueId = entry?.unique_id;
+      if (uniqueId) {
+        uniqueIds[entityId] = uniqueId;
+      }
+    }
+
+    return uniqueIds;
+  }
+
+  private extractEsphomeNodeName(device: DeviceRegistryEntry): string | undefined {
+    for (const [domain, identifier] of device.identifiers ?? []) {
+      if (typeof domain === 'string' && typeof identifier === 'string' && domain.toLowerCase() === 'esphome') {
+        return identifier;
+      }
+    }
+    return this.slugifyDeviceName(device.name);
+  }
+
+  private slugifyDeviceName(name: string | null | undefined): string | undefined {
+    if (!name) return undefined;
+    const slug = name
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '_')
+      .replace(/^_+|_+$/g, '');
+    return slug || undefined;
+  }
+
   /**
    * Convert nested EntityMappings to flat Record<string, string> format.
    * This is the same logic used in migration but exposed for discovery.
@@ -1039,6 +1182,11 @@ export class EntityDiscoveryService {
     if (em.installationAngleEntity) mappings['installationAngle'] = em.installationAngleEntity;
     if (em.polygonZonesEnabledEntity) mappings['polygonZonesEnabled'] = em.polygonZonesEnabledEntity;
     if (em.trackingTargetCountEntity) mappings['trackingTargetCount'] = em.trackingTargetCountEntity;
+    if (em.firmwareUpdateEntity) mappings['firmwareUpdate'] = em.firmwareUpdateEntity;
+
+    // Entry/Exit feature entities
+    if (em.assumedPresentEntity) mappings['assumedPresent'] = em.assumedPresentEntity;
+    if (em.assumedPresentRemainingEntity) mappings['assumedPresentRemaining'] = em.assumedPresentRemainingEntity;
 
     // Zone config entities (rectangular)
     this.flattenZoneEntitiesToFlat(mappings, em.zoneConfigEntities, 'zone');
@@ -1140,5 +1288,89 @@ export class EntityDiscoveryService {
       if (targetSet.resolution) mappings[`target${index}Resolution`] = targetSet.resolution;
       if (targetSet.active) mappings[`target${index}Active`] = targetSet.active;
     }
+  }
+
+  /**
+   * Discover an ESPHome service for a device by suffix.
+   * Uses two methods:
+   * 1. Query getServicesForTarget for device-specific services
+   * 2. Construct expected service name from esphomeNodeName and verify it exists
+   */
+  private async discoverServiceBySuffix(
+    deviceId: string,
+    esphomeNodeName: string | undefined,
+    suffix: string,
+    logLabel: string
+  ): Promise<string | null> {
+    let discoveredService: string | undefined;
+
+    // Method 1: Try getServicesForTarget (works for some devices)
+    try {
+      const services = await this.readTransport.getServicesForTarget({ device_id: [deviceId] });
+      logger.info(
+        { deviceId, servicesCount: services.length, services: services.slice(0, 10) },
+        'Service discovery Method 1: getServicesForTarget result'
+      );
+      discoveredService = services.find((s) => s.endsWith(suffix));
+      if (discoveredService) {
+        logger.info(
+          { deviceId, service: discoveredService, logLabel },
+          'Found service via getServicesForTarget'
+        );
+        return discoveredService;
+      } else {
+        logger.info(
+          { deviceId, logLabel },
+          'Method 1: No matching service found in getServicesForTarget result'
+        );
+      }
+    } catch (err) {
+      logger.warn({ err, deviceId }, 'getServicesForTarget failed (non-fatal)');
+    }
+
+    // Method 2: If Method 1 failed and we have esphomeNodeName, construct expected name and verify it exists
+    if (esphomeNodeName) {
+      try {
+        const expectedService = `esphome.${esphomeNodeName}${suffix}`;
+        logger.info(
+          { deviceId, esphomeNodeName, expectedService, logLabel },
+          'Service discovery Method 2: trying esphomeNodeName construction'
+        );
+        const allEsphomeServices = await this.readTransport.getServicesByDomain('esphome');
+        logger.info(
+          {
+            deviceId,
+            totalServices: allEsphomeServices.length,
+            matchingServices: allEsphomeServices.filter((s) => s.endsWith(suffix)),
+            logLabel,
+          },
+          'Service discovery Method 2: matching ESPHome services'
+        );
+        if (allEsphomeServices.includes(expectedService)) {
+          logger.info(
+            { deviceId, service: expectedService, logLabel },
+            'Found service via esphomeNodeName construction'
+          );
+          return expectedService;
+        } else {
+          logger.info(
+            {
+              deviceId,
+              expectedService,
+              available: allEsphomeServices.filter((s) => s.endsWith(suffix)),
+              logLabel,
+            },
+            'Method 2: Expected service not found in available services'
+          );
+        }
+      } catch (err) {
+        logger.warn({ err, deviceId }, 'getServicesByDomain fallback failed (non-fatal)');
+      }
+    } else {
+      logger.warn({ deviceId, logLabel }, 'Service discovery Method 2 skipped: no esphomeNodeName available');
+    }
+
+    logger.warn({ deviceId, esphomeNodeName, logLabel }, 'Service discovery: failed to find service');
+    return null;
   }
 }

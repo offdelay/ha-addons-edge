@@ -43,6 +43,16 @@ export interface DeviceRegistryEntry {
 }
 
 /**
+ * Target selector for triggers/conditions/services
+ */
+export interface HaTarget {
+  entity_id?: string[];
+  device_id?: string[];
+  area_id?: string[];
+  label_id?: string[];
+}
+
+/**
  * Callback for state change events
  */
 export type StateChangeCallback = (
@@ -84,6 +94,19 @@ export interface IHaReadTransport {
    * List all areas from the area registry
    */
   listAreaRegistry(): Promise<AreaRegistryEntry[]>;
+
+  /**
+   * List services applicable to a target (WebSocket only in HA).
+   */
+  getServicesForTarget(target: HaTarget, expandGroup?: boolean): Promise<string[]>;
+
+  /**
+   * List all services for a given domain registered in Home Assistant.
+   * Used for manual service selection when auto-discovery fails.
+   * @param domain - Service domain (e.g., "esphome", "light", "switch")
+   * @returns Array of fully qualified service names (e.g., "esphome.device_get_build_flags")
+   */
+  getServicesByDomain(domain: string): Promise<string[]>;
 
   // ─────────────────────────────────────────────────────────────────
   // State Queries

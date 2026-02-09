@@ -36,6 +36,8 @@ interface ZoneCanvasProps {
   onFurnitureSelect?: (id: string | null) => void;
   doors?: Door[];
   onDragStateChange?: (isDragging: boolean) => void;
+  // Zone labels from device mapping (overrides zone.label)
+  zoneLabels?: Record<string, string>;
   // Visibility toggles
   showWalls?: boolean;
   showFurniture?: boolean;
@@ -81,6 +83,7 @@ export const ZoneCanvas: React.FC<ZoneCanvasProps> = ({
   onFurnitureSelect,
   doors = [],
   onDragStateChange,
+  zoneLabels,
   showWalls = true,
   showFurniture = true,
   showDoors = true,
@@ -321,6 +324,7 @@ export const ZoneCanvas: React.FC<ZoneCanvasProps> = ({
       showFurniture={false}
       showDoors={showDoors}
       showDevice={showDevice}
+      deviceInteractive={false}
       lockShell
       renderOverlay={(params) => {
         const { toCanvas, toWorldFromEvent } = params;
@@ -460,7 +464,7 @@ export const ZoneCanvas: React.FC<ZoneCanvasProps> = ({
                   textShadow: '0 1px 3px rgba(0,0,0,0.8)'
                 }}
               >
-                {zone.label || zone.id}
+                {zoneLabels?.[zone.id] || zone.label || zone.id}
               </text>
               {/* Resize handles */}
               {handles.map((handle) => (
@@ -576,7 +580,7 @@ export const ZoneCanvas: React.FC<ZoneCanvasProps> = ({
                   textShadow: '0 1px 3px rgba(0,0,0,0.8)'
                 }}
               >
-                {polygon.label || polygon.id}
+                {zoneLabels?.[polygon.id] || polygon.label || polygon.id}
               </text>
               {/* Vertex handles (only when selected) */}
               {isSelected && canvasVertices.map((v, idx) => (
@@ -649,16 +653,22 @@ export const ZoneCanvas: React.FC<ZoneCanvasProps> = ({
           );
         }).filter(Boolean) : [];
 
-        // Render custom overlay if provided
+        // Render custom overlay if provided (rendered BEFORE zones so zones are on top)
         const customOverlay = renderOverlay ? renderOverlay(params) : null;
+
+        // Extract device element from params (passed by RoomCanvas when deviceInteractive=false)
+        const deviceElement = (params as any).deviceElement;
 
         return (
           <>
             {furnitureElements}
+            {/* Device element rendered after furniture but before targets/zones (non-interactive mode) */}
+            {deviceElement}
+            {/* Custom overlay (targets, etc.) rendered before zones so zones are interactable */}
+            {customOverlay}
             {/* Show rectangle zones when NOT in polygon mode, polygon zones when in polygon mode */}
             {!polygonMode && zoneElements}
             {polygonMode && polygonZoneElements}
-            {customOverlay}
           </>
         );
       }}

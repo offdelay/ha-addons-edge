@@ -131,6 +131,7 @@ export interface EntityMappings {
   thresholdFactorEntity?: string;
   microMotionEntity?: string;
   updateRateEntity?: string;
+  firmwareUpdateEntity?: string;
   installationAngleEntity?: string;
   polygonZonesEnabledEntity?: string;
 
@@ -181,6 +182,10 @@ export interface EntityMappings {
     target2?: TargetEntitySet;
     target3?: TargetEntitySet;
   };
+
+  // Entry/Exit feature entities (EPL)
+  assumedPresentEntity?: string;
+  assumedPresentRemainingEntity?: string;
 
   // Settings entities (device configuration controls)
   settingsEntities?: Record<string, string>;

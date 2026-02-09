@@ -88,7 +88,11 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
   const [showDeviceSettings, setShowDeviceSettings] = useState(false);
   const [showRecommendations, setShowRecommendations] = useState(false);
   // Polygon mode state
-  const [polygonModeStatus, setPolygonModeStatus] = useState<PolygonModeStatus>({ supported: false, enabled: false });
+  const [polygonModeStatus, setPolygonModeStatus] = useState<PolygonModeStatus>({
+    supported: false,
+    enabled: false,
+    controllable: false,
+  });
   const [polygonZones, setPolygonZones] = useState<ZonePolygon[]>([]);
   // Display settings (persisted to localStorage) - includes heatmap settings
   const {
@@ -98,6 +102,7 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
     showZones, setShowZones,
     showDeviceIcon, setShowDeviceIcon,
     showDeviceRadar, setShowDeviceRadar,
+    showTargets, setShowTargets,
     showAlignedDirection, setShowAlignedDirection,
     clipRadarToWalls, setClipRadarToWalls,
     heatmapEnabled, setHeatmapEnabled,
@@ -387,19 +392,21 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
   }, [propTargetPositions, smoothTracking, showLiveOverlays]);
 
   // Fetch existing zones from device when room is loaded
-  // Using refs to prevent re-fetching when entityMappings changes (which happens after zone sync)
+  // Using ref to prevent re-fetching for the same room
   const lastZonesFetchedRoomId = React.useRef<string | null>(null);
-  const lastZonesFetchedMappingsReady = React.useRef<boolean>(false);
   useEffect(() => {
     const loadZonesFromDevice = async () => {
       if (!selectedRoom || !selectedRoom.deviceId || !selectedRoom.profileId) {
         return;
       }
 
-      // Only fetch once per room, or when mappings become ready for the first time
-      const mappingsReady = !mappingLoading;
-      if (selectedRoom.id === lastZonesFetchedRoomId.current &&
-          lastZonesFetchedMappingsReady.current === mappingsReady) {
+      // Wait for mappings to be ready before fetching
+      if (mappingLoading) {
+        return;
+      }
+
+      // Only fetch once per room
+      if (selectedRoom.id === lastZonesFetchedRoomId.current) {
         return;
       }
 
@@ -416,7 +423,6 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
 
       // Mark as fetched before the async call to prevent duplicate requests
       lastZonesFetchedRoomId.current = selectedRoom.id;
-      lastZonesFetchedMappingsReady.current = mappingsReady;
 
       try {
         // Skip entityMappings if device has valid mappings stored
@@ -453,7 +459,7 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
   useEffect(() => {
     const loadPolygonModeStatus = async () => {
       if (!selectedRoom?.deviceId || !selectedRoom?.profileId) {
-        setPolygonModeStatus({ supported: false, enabled: false });
+        setPolygonModeStatus({ supported: false, enabled: false, controllable: false });
         return;
       }
 
@@ -471,7 +477,7 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
       }
 
       if (!entityNamePrefix) {
-        setPolygonModeStatus({ supported: false, enabled: false });
+        setPolygonModeStatus({ supported: false, enabled: false, controllable: false });
         return;
       }
 
@@ -490,7 +496,7 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
         );
         setPolygonModeStatus(status);
       } catch (err) {
-        setPolygonModeStatus({ supported: false, enabled: false });
+        setPolygonModeStatus({ supported: false, enabled: false, controllable: false });
       }
     };
 
@@ -793,6 +799,19 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
         <div
           className="h-full w-full overflow-hidden overscroll-contain touch-none"
           onWheelCapture={(e) => {
+            // Check if the event target is within a scrollable container (like activity log panel)
+            // If so, let the native scroll happen instead of zooming
+            let target = e.target as HTMLElement | null;
+            while (target && target !== e.currentTarget) {
+              const style = window.getComputedStyle(target);
+              const overflowY = style.overflowY;
+              if (overflowY === 'auto' || overflowY === 'scroll') {
+                // Target is in a scrollable container, don't zoom
+                return;
+              }
+              target = target.parentElement;
+            }
+
             if (e.cancelable) e.preventDefault();
             if ((e.nativeEvent as any)?.cancelable) {
               (e.nativeEvent as any).preventDefault();
@@ -830,6 +849,7 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
             showRadar={showDeviceRadar}
             furniture={selectedRoom.furniture ?? []}
             doors={selectedRoom.doors ?? []}
+            zoneLabels={deviceMapping?.zoneLabels}
             showWalls={showWalls}
             showFurniture={showFurniture}
             showDoors={showDoors}
@@ -913,7 +933,7 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
               ) : null;
 
               // Render live target positions (EP Lite with tracking)
-              const targetElements = displayTargetPositions.length > 0 ? (
+              const targetElements = showTargets && displayTargetPositions.length > 0 ? (
                 <g>
                   {/* Render trails first (so they appear behind targets) */}
                   {showTrails && displayTargetPositions.map((target) => {
@@ -1337,7 +1357,7 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
                                   className="w-3 h-3 rounded border border-white/50"
                                   style={{ backgroundColor: regularZoneColors[index % regularZoneColors.length] }}
                                 />
-                                <span className="text-slate-300">{zone.label || zone.id}</span>
+                                <span className="text-slate-300">{deviceMapping?.zoneLabels?.[zone.id] || zone.label || zone.id}</span>
                               </div>
                             ));
                           })()}
@@ -1357,7 +1377,7 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
                                   className="w-3 h-3 rounded border border-white/50"
                                   style={{ backgroundColor: regularZoneColors[index % regularZoneColors.length] }}
                                 />
-                                <span className="text-slate-300">{zone.label || zone.id}</span>
+                                <span className="text-slate-300">{deviceMapping?.zoneLabels?.[zone.id] || zone.label || zone.id}</span>
                               </div>
                             ));
                           })()}
@@ -1473,7 +1493,7 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
                           const regularZoneColors = ['#3b82f6', '#8b5cf6', '#ec4899', '#f59e0b'];
                           // Find the matching zone to get its label
                           const matchingZone = selectedRoom?.zones?.find(z => z.id === `Zone ${zoneNum}` || z.id === `zone${zoneNum}` || z.id === `zone_${zoneNum}`);
-                          const zoneLabel = matchingZone?.label || `Zone ${zoneNum}`;
+                          const zoneLabel = (matchingZone && deviceMapping?.zoneLabels?.[matchingZone.id]) || matchingZone?.label || `Zone ${zoneNum}`;
 
                           return (
                             <div
@@ -1910,6 +1930,18 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
                         <span className="flex items-center gap-1.5">
                           <span className="w-3 h-3 rounded-full bg-green-500"></span>
                           Device Icon
+                        </span>
+                      </label>
+                      <label className="flex items-center gap-2 cursor-pointer text-sm text-slate-200 hover:text-white transition-colors">
+                        <input
+                          type="checkbox"
+                          checked={showTargets}
+                          onChange={(e) => setShowTargets(e.target.checked)}
+                          className="w-4 h-4 rounded border-slate-600 bg-slate-800 text-cyan-500 focus:ring-cyan-500 focus:ring-offset-0"
+                        />
+                        <span className="flex items-center gap-1.5">
+                          <span className="w-3 h-3 rounded-full bg-cyan-500"></span>
+                          Targets
                         </span>
                       </label>
                     </div>
