@@ -1,6 +1,6 @@
 ---
 name: evcc
-version: 0.300.8
+version: 0.309.1
 slug: evcc
 description: EV Charge Controller!
 url: https://github.com/evcc-io/evcc
@@ -27,8 +27,9 @@ options:
 schema:
   sqlite_file: str
   config_file: str?
-  EVOPT_URI: url?
+  OPTIMIZER_URI: url?
   SEMP_BASE_URL: url?
+  EVCC_REMOTE_ACCESS: str?
 host_network: true
 map: 
   - type: addon_config
