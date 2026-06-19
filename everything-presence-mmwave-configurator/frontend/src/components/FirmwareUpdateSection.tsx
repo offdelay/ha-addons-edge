@@ -31,6 +31,7 @@ import {
   FirmwareUpdateEntityStatus,
   DeviceProfile,
   ZoneBackup,
+  Zone,
   ZoneRect,
   ZonePolygon,
 } from '../api/types';
@@ -38,6 +39,7 @@ import { useDeviceMappings } from '../contexts/DeviceMappingsContext';
 import { DeviceMapping, discoverAndSaveMapping } from '../api/deviceMappings';
 import { fetchPolygonZonesFromDevice } from '../api/zones';
 import { compareVersions, getZoneMigrationThreshold, requiresZoneMigration } from '../utils/firmware';
+import { resolveEntityPrefix } from '../utils/entityUtils';
 import polygonMigrationGraphic from '../assets/polygon-migration.png';
 
 interface FirmwareUpdateSectionProps {
@@ -155,6 +157,7 @@ export const FirmwareUpdateSection: React.FC<FirmwareUpdateSectionProps> = ({
   const [updateStatus, setUpdateStatus] = useState<FirmwareUpdateStatus>('idle');
   const [preparedToken, setPreparedToken] = useState<string | null>(null);
   const [preparedVersion, setPreparedVersion] = useState<string | null>(null);
+  const [preparedMigrationMeta, setPreparedMigrationMeta] = useState<AvailableUpdate['migration'] | null>(null);
   const [updateEntityStatus, setUpdateEntityStatus] = useState<FirmwareUpdateEntityStatus | null>(null);
   const [updateProgress, setUpdateProgress] = useState<number | null>(null);
   const [updateMonitorMessage, setUpdateMonitorMessage] = useState<string | null>(null);
@@ -354,6 +357,7 @@ export const FirmwareUpdateSection: React.FC<FirmwareUpdateSectionProps> = ({
     setUpdateStatus('idle');
     setPreparedToken(null);
     setPreparedVersion(null);
+    setPreparedMigrationMeta(null);
     setUpdateEntityStatus(null);
     setUpdateProgress(null);
     setUpdateMonitorMessage(null);
@@ -602,6 +606,7 @@ export const FirmwareUpdateSection: React.FC<FirmwareUpdateSectionProps> = ({
       setUpdateStatus('preparing');
       setPreparedToken(null);
       setPreparedVersion(null);
+      setPreparedMigrationMeta(null);
 
       setUpdateStatus('downloading');
       const prepareRes = await prepareFirmware(selectedDeviceId, manifestUrl, {
@@ -725,6 +730,7 @@ export const FirmwareUpdateSection: React.FC<FirmwareUpdateSectionProps> = ({
       setUpdateStatus('preparing');
       setPreparedToken(null);
       setPreparedVersion(null);
+      setPreparedMigrationMeta(null);
       setValidation(null);
 
       setUpdateStatus('downloading');
@@ -736,6 +742,7 @@ export const FirmwareUpdateSection: React.FC<FirmwareUpdateSectionProps> = ({
 
       setPreparedToken(res.prepared.token);
       setPreparedVersion(res.newVersion);
+      setPreparedMigrationMeta(res.migration ?? null);
       setValidation(res.validation);
       setUpdateStatus('ready');
 
@@ -746,7 +753,7 @@ export const FirmwareUpdateSection: React.FC<FirmwareUpdateSectionProps> = ({
         resolved.firmwareVersion,
         res.newVersion,
         resolved.model,
-        null
+        res.migration ?? null
       );
       if (migrationInfo?.required) {
         promptMigration();
@@ -829,6 +836,7 @@ export const FirmwareUpdateSection: React.FC<FirmwareUpdateSectionProps> = ({
     if (migrationGate?.required) {
       setPreparedToken(entry.token);
       setPreparedVersion(entry.version);
+      setPreparedMigrationMeta(null);
       setUpdateStatus('ready');
       setUpdateModalOpen(true);
       promptMigration();
@@ -838,6 +846,7 @@ export const FirmwareUpdateSection: React.FC<FirmwareUpdateSectionProps> = ({
     try {
       setPreparedToken(entry.token);
       setPreparedVersion(entry.version);
+      setPreparedMigrationMeta(null);
       setUpdateModalOpen(true);
       await triggerUpdateOnDevice(entry.token);
     } catch (err) {
@@ -874,7 +883,10 @@ export const FirmwareUpdateSection: React.FC<FirmwareUpdateSectionProps> = ({
 
     const mapping = backupMapping ?? (await getMapping(selectedDeviceId));
     const profileId = mapping?.profileId ?? getDeviceProfile(device)?.id ?? '';
-    const entityNamePrefix = device.entityNamePrefix || undefined;
+    const entityNamePrefix = resolveEntityPrefix({
+      mappingPrefix: mapping?.esphomeNodeName,
+      devicePrefix: device.entityNamePrefix,
+    }) ?? undefined;
 
     if (!profileId) {
       onErrorRef.current('Device profile not found. Run entity discovery to sync the device.');
@@ -1014,28 +1026,47 @@ export const FirmwareUpdateSection: React.FC<FirmwareUpdateSectionProps> = ({
     return true;
   };
 
+  const isBackupRect = (zone: Zone): zone is ZoneRect =>
+    typeof zone === 'object' && zone !== null && 'width' in zone && 'height' in zone;
+
+  const isBackupPolygon = (zone: Zone): zone is ZonePolygon =>
+    typeof zone === 'object' && zone !== null && 'vertices' in zone;
+
   const buildExpectedPolygons = (backup: ZoneBackup, limits: DeviceProfile['limits'] | undefined): ZonePolygon[] => {
     const maxZones = limits?.maxZones ?? 4;
     const maxExclusion = limits?.maxExclusionZones ?? 2;
     const maxEntry = limits?.maxEntryZones ?? 2;
 
-    const regularZones = sortZonesByIndex(
-      backup.zones.filter((zone) => zone.type === 'regular' && isValidRect(zone))
+    const regularPolygonZones = sortZonesByIndex(
+      backup.zones.filter((zone): zone is ZonePolygon => zone.type === 'regular' && isBackupPolygon(zone))
     ).slice(0, maxZones);
-    const exclusionZones = sortZonesByIndex(
-      backup.zones.filter((zone) => zone.type === 'exclusion' && isValidRect(zone))
+    const exclusionPolygonZones = sortZonesByIndex(
+      backup.zones.filter((zone): zone is ZonePolygon => zone.type === 'exclusion' && isBackupPolygon(zone))
     ).slice(0, maxExclusion);
-    const entryZones = sortZonesByIndex(
-      backup.zones.filter((zone) => zone.type === 'entry' && isValidRect(zone))
+    const entryPolygonZones = sortZonesByIndex(
+      backup.zones.filter((zone): zone is ZonePolygon => zone.type === 'entry' && isBackupPolygon(zone))
+    ).slice(0, maxEntry);
+
+    const regularRectZones = sortZonesByIndex(
+      backup.zones.filter((zone): zone is ZoneRect => zone.type === 'regular' && isBackupRect(zone) && isValidRect(zone))
+    ).slice(0, maxZones);
+    const exclusionRectZones = sortZonesByIndex(
+      backup.zones.filter((zone): zone is ZoneRect => zone.type === 'exclusion' && isBackupRect(zone) && isValidRect(zone))
+    ).slice(0, maxExclusion);
+    const entryRectZones = sortZonesByIndex(
+      backup.zones.filter((zone): zone is ZoneRect => zone.type === 'entry' && isBackupRect(zone) && isValidRect(zone))
     ).slice(0, maxEntry);
 
     return [
       // IMPORTANT: restore writes zones sequentially into slot 1..N regardless of original slot index.
       // If a backup has gaps (e.g. Exclusion 2 only), it will be restored into Exclusion 1.
       // Verification must mirror that behavior to avoid false warnings.
-      ...regularZones.map((zone, idx) => ({ ...rectToPolygon(zone), id: `Zone ${idx + 1}` })),
-      ...exclusionZones.map((zone, idx) => ({ ...rectToPolygon(zone), id: `Exclusion ${idx + 1}` })),
-      ...entryZones.map((zone, idx) => ({ ...rectToPolygon(zone), id: `Entry ${idx + 1}` })),
+      ...regularPolygonZones.map((zone, idx) => ({ ...zone, id: `Zone ${idx + 1}` })),
+      ...exclusionPolygonZones.map((zone, idx) => ({ ...zone, id: `Exclusion ${idx + 1}` })),
+      ...entryPolygonZones.map((zone, idx) => ({ ...zone, id: `Entry ${idx + 1}` })),
+      ...regularRectZones.map((zone, idx) => ({ ...rectToPolygon(zone), id: `Zone ${regularPolygonZones.length + idx + 1}` })),
+      ...exclusionRectZones.map((zone, idx) => ({ ...rectToPolygon(zone), id: `Exclusion ${exclusionPolygonZones.length + idx + 1}` })),
+      ...entryRectZones.map((zone, idx) => ({ ...rectToPolygon(zone), id: `Entry ${entryPolygonZones.length + idx + 1}` })),
     ];
   };
 
@@ -1246,7 +1277,7 @@ export const FirmwareUpdateSection: React.FC<FirmwareUpdateSectionProps> = ({
         currentFirmwareVersion,
         preparedVersion,
         deviceConfig?.model ?? selectedDevice?.model ?? undefined,
-        selectedUpdate?.migration ?? null
+        preparedMigrationMeta
       )
     : null;
   const restoreBackupId = migrationBackupId ?? lastBackupId ?? latestBackup?.id ?? null;
@@ -1382,6 +1413,7 @@ export const FirmwareUpdateSection: React.FC<FirmwareUpdateSectionProps> = ({
     const deviceName =
       backupMapping?.deviceName ??
       device.name ??
+      backupMapping?.esphomeNodeName ??
       device.entityNamePrefix ??
       device.model ??
       'Device';
@@ -1880,6 +1912,7 @@ export const FirmwareUpdateSection: React.FC<FirmwareUpdateSectionProps> = ({
       const deviceName =
         backupMapping?.deviceName ??
         device.name ??
+        backupMapping?.esphomeNodeName ??
         device.entityNamePrefix ??
         device.model ??
         'Device';
@@ -1922,8 +1955,10 @@ export const FirmwareUpdateSection: React.FC<FirmwareUpdateSectionProps> = ({
       }
 
       // Before restoring zones, wait for polygon entities to become available after the update.
-      const entityNamePrefix =
-        device.entityNamePrefix ?? result.mapping?.esphomeNodeName ?? backupMapping?.esphomeNodeName ?? null;
+      const entityNamePrefix = resolveEntityPrefix({
+        mappingPrefix: result.mapping?.esphomeNodeName ?? backupMapping?.esphomeNodeName,
+        devicePrefix: device.entityNamePrefix,
+      });
       if (entityNamePrefix) {
         const backupId = migrationBackupId ?? lastBackupId ?? latestBackup?.id ?? null;
         const backup = backupId ? zoneBackups.find((item) => item.id === backupId) ?? null : null;
@@ -2503,7 +2538,7 @@ export const FirmwareUpdateSection: React.FC<FirmwareUpdateSectionProps> = ({
                         To avoid installing incompatible firmware, updates are disabled.
                       </p>
                       <p className="mb-3 text-xs text-amber-200">
-                        Flash the latest firmware via USB to enable over-the-air updates in this add-on.
+                        Flash the latest firmware via USB to enable over-the-air updates in this app.
                       </p>
                       <a
                         href="https://docs.everythingsmart.io"

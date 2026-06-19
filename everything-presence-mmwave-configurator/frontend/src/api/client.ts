@@ -50,6 +50,24 @@ export const fetchProfiles = async () => {
   return handle<{ profiles: DeviceProfile[] }>(res);
 };
 
+export interface MetaConfigResponse {
+  appVersion: string;
+  port: number;
+  mode: string;
+  readTransport: string;
+  writeTransport: string;
+  transportStatus?: {
+    websocket: string;
+    rest: string;
+  };
+  ha: unknown;
+}
+
+export const fetchMetaConfig = async () => {
+  const res = await fetch(ingressAware('api/meta/config'));
+  return handle<MetaConfigResponse>(res);
+};
+
 export const fetchSettings = async () => {
   const res = await fetch(ingressAware('api/settings'));
   return handle<{ settings: AppSettings }>(res);
@@ -222,17 +240,19 @@ export const deleteCustomFurniture = async (id: string) => {
 export const fetchHeatmap = async (
   deviceId: string,
   profileId: string,
-  entityNamePrefix: string,
+  entityNamePrefix: string | null,
   hours: number = 24,
   resolution: number = 400,
   entityMappings?: EntityMappings
 ): Promise<HeatmapResponse> => {
   const params = new URLSearchParams({
     profileId,
-    entityNamePrefix,
     hours: hours.toString(),
     resolution: resolution.toString(),
   });
+  if (entityNamePrefix) {
+    params.set('entityNamePrefix', entityNamePrefix);
+  }
   if (entityMappings) {
     params.set('entityMappings', JSON.stringify(entityMappings));
   }

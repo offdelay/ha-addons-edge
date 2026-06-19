@@ -5,6 +5,7 @@ export interface ZoneRect {
   y: number;
   width: number;
   height: number;
+  timeout?: number;
   enabled?: boolean; // Whether this zone slot is active/configured
   label?: string; // Custom display label (e.g., "Bed", "Chair")
 }
@@ -43,6 +44,12 @@ export interface DevicePlacement {
   x: number;
   y: number;
   rotationDeg?: number;
+  mountType?: 'wall' | 'ceiling';
+  heightMm?: number;
+  pitchDeg?: number;
+  coveragePresetId?: string;
+  horizontalFovDeg?: number;
+  verticalFovDeg?: number;
 }
 
 export interface FurnitureInstance {
@@ -133,6 +140,7 @@ export interface EntityMappings {
   updateRateEntity?: string;
   firmwareUpdateEntity?: string;
   installationAngleEntity?: string;
+  upsideDownMountingEntity?: string;
   polygonZonesEnabledEntity?: string;
 
   // EPL tracking target count

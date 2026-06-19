@@ -13,6 +13,7 @@ interface LiveClientSubscription {
   deviceId: string;
   profileId: string;
   entityIds: Set<string>;
+  entityKeysById: Map<string, string>;
   subscriptionId: string;
 }
 
@@ -24,33 +25,6 @@ export function createLiveWebSocketServer(
   const wss = new WebSocketServer({ server: httpServer, path: '/api/live/ws' });
   const clients: Map<WebSocket, LiveClientSubscription> = new Map();
 
-  // Subscribe to HA state changes
-  readTransport.subscribeToStateChanges(
-    [], // Empty = subscribe to all entities
-    (entityId: string, newState: EntityState | null, _oldState: EntityState | null) => {
-      if (!entityId || !newState) return;
-
-      // Broadcast to clients subscribed to this entity
-      clients.forEach((subscription, clientWs) => {
-        if (subscription.entityIds.has(entityId) && clientWs.readyState === WebSocket.OPEN) {
-          try {
-            clientWs.send(
-              JSON.stringify({
-                type: 'state_update',
-                entityId,
-                state: newState.state,
-                attributes: newState.attributes,
-                timestamp: Date.now(),
-              }),
-            );
-          } catch (err) {
-            logger.error({ err, entityId }, 'Failed to send state update to client');
-          }
-        }
-      });
-    }
-  );
-
   wss.on('connection', (ws: WebSocket) => {
     logger.info('Live tracking WebSocket client connected');
 
@@ -59,7 +33,7 @@ export function createLiveWebSocketServer(
         const message = JSON.parse(data.toString());
 
         if (message.type === 'subscribe') {
-          const { deviceId, profileId, entityNamePrefix, entityMappings } = message;
+          const { deviceId, profileId, entityMappings } = message;
 
           if (!deviceId || !profileId) {
             ws.send(JSON.stringify({ type: 'error', error: 'deviceId and profileId required' }));
@@ -69,17 +43,6 @@ export function createLiveWebSocketServer(
           const profile = profileLoader.getProfileById(profileId);
           if (!profile) {
             ws.send(JSON.stringify({ type: 'error', error: 'Profile not found' }));
-            return;
-          }
-
-          // Use entityNamePrefix if provided, otherwise try to extract from deviceId
-          const deviceName = entityNamePrefix ||
-            deviceId
-              .replace(/^(sensor|binary_sensor|number)\./, '')
-              .replace(/_occupancy$|_mmwave_target_distance$/, '');
-
-          if (!deviceName) {
-            ws.send(JSON.stringify({ type: 'error', error: 'Could not determine entity name prefix' }));
             return;
           }
 
@@ -97,39 +60,50 @@ export function createLiveWebSocketServer(
             }
           }
 
-          // Check if device has device-level mappings (preferred)
           const hasDeviceMapping = deviceMappingStorage.hasMapping(deviceId);
-
-          // Signal MAPPING_NOT_FOUND if no device mapping and no legacy mappings provided
           const hasMappings = hasDeviceMapping || !!parsedMappings;
           if (!hasMappings) {
-            logger.warn({ deviceId, profileId }, 'No device mappings found - entity resolution may fail');
-            // Send warning to client - they should run entity discovery
             ws.send(JSON.stringify({
-              type: 'warning',
+              type: 'error',
               code: 'MAPPING_NOT_FOUND',
               message: 'No entity mappings found for this device. Run entity discovery to auto-match entities.',
               deviceId,
             }));
+            return;
           }
 
           // Build list of entity IDs to monitor using EntityResolver
           const entityIds = new Set<string>();
+          const entityKeysById = new Map<string, string>();
           const entityMap = profile.entityMap as any;
 
-          // Helper to resolve entity ID - tries device mapping first, then legacy
+          // Helper to resolve entity ID - tries device mapping first, then room-stored mappings.
           const addEntity = (mappingKey: string, pattern: string | null | undefined) => {
             let entityId: string | null = null;
             // Try device-level mapping first
             if (hasDeviceMapping) {
               entityId = deviceEntityService.getEntityId(deviceId, mappingKey);
             }
-            // Fallback to legacy resolution
             if (!entityId) {
-              entityId = EntityResolver.resolve(parsedMappings, deviceName, mappingKey, pattern);
+              entityId = EntityResolver.resolve(parsedMappings, undefined, mappingKey, pattern);
             }
             if (entityId) {
               entityIds.add(entityId);
+              entityKeysById.set(entityId, mappingKey);
+            }
+          };
+
+          const addMappedEntity = (mappingKey: string) => {
+            let entityId: string | null = null;
+            if (hasDeviceMapping) {
+              entityId = deviceEntityService.getEntityId(deviceId, mappingKey);
+            } else {
+              const mapped = (parsedMappings as Record<string, unknown> | undefined)?.[mappingKey];
+              entityId = typeof mapped === 'string' ? mapped : null;
+            }
+            if (entityId) {
+              entityIds.add(entityId);
+              entityKeysById.set(entityId, mappingKey);
             }
           };
 
@@ -155,6 +129,7 @@ export function createLiveWebSocketServer(
           addEntity('trackingTargetsEntity', entityMap.trackingTargetsEntity);
           addEntity('maxDistanceEntity', entityMap.maxDistanceEntity);
           addEntity('installationAngleEntity', entityMap.installationAngleEntity);
+          addEntity('upsideDownMountingEntity', entityMap.upsideDownMountingEntity);
 
           // EP1 config entities for distance overlays
           addEntity('distanceMaxEntity', entityMap.distanceMaxEntity);
@@ -186,13 +161,12 @@ export function createLiveWebSocketServer(
                 addEntity(zoneTargetCountKey, targetCountTemplate);
               }
               if (occupancyTemplate) {
-                addEntity(zoneOccupancyKey, occupancyTemplate);
+                addMappedEntity(zoneOccupancyKey);
               }
             }
           }
 
-          // Subscribe to target position entities (target_1, target_2, target_3)
-          // Tries device mapping first, then legacy resolution
+          // Subscribe to target position entities (target_1, target_2, target_3).
           for (let i = 1; i <= 3; i++) {
             const targetProps: Array<'x' | 'y' | 'distance' | 'speed' | 'angle' | 'resolution' | 'active'> =
               ['x', 'y', 'distance', 'speed', 'angle', 'resolution', 'active'];
@@ -209,9 +183,8 @@ export function createLiveWebSocketServer(
               if (targetSet && targetSet[prop]) {
                 entityId = targetSet[prop] as string;
               }
-              // Fallback to legacy resolution
               if (!entityId) {
-                entityId = EntityResolver.resolveTargetEntity(parsedMappings, deviceName, i, prop);
+                entityId = EntityResolver.resolveTargetEntity(parsedMappings, undefined, i, prop);
               }
               if (entityId) {
                 entityIds.add(entityId);
@@ -227,17 +200,48 @@ export function createLiveWebSocketServer(
             addEntity('assumedPresentRemaining', entities.assumedPresentRemaining.template);
           }
 
-          // Store subscription
+          const existingSubscription = clients.get(ws);
+          if (existingSubscription?.subscriptionId) {
+            readTransport.unsubscribe(existingSubscription.subscriptionId);
+          }
+
           const subscriptionId = `${deviceId}-${Date.now()}`;
+          const stateSubscriptionId = readTransport.subscribeToStateChanges(
+            Array.from(entityIds),
+            (entityId: string, newState: EntityState | null, _oldState: EntityState | null) => {
+              if (!entityId || !newState || ws.readyState !== WebSocket.OPEN) return;
+
+              const entityKey = entityKeysById.get(entityId);
+              try {
+                ws.send(
+                  JSON.stringify({
+                    type: 'state_update',
+                    entityKey,
+                    entityId,
+                    state: newState.state,
+                    attributes: newState.attributes,
+                    timestamp: Date.now(),
+                  }),
+                );
+              } catch (err) {
+                logger.error({ err, entityId, deviceId }, 'Failed to send state update to client');
+              }
+            },
+          );
+
           clients.set(ws, {
             ws,
             deviceId,
             profileId,
             entityIds,
-            subscriptionId,
+            entityKeysById,
+            subscriptionId: stateSubscriptionId || subscriptionId,
           });
 
-          logger.info({ deviceId, profileId, entityCount: entityIds.size }, 'Client subscribed to live tracking');
+          logger.info(
+            { deviceId, profileId, entityCount: entityIds.size },
+            'Client subscribed to live tracking'
+          );
 
           // Send initial states using read transport bulk query
           try {
@@ -277,6 +281,10 @@ export function createLiveWebSocketServer(
             );
           }
         } else if (message.type === 'unsubscribe') {
+          const subscription = clients.get(ws);
+          if (subscription?.subscriptionId) {
+            readTransport.unsubscribe(subscription.subscriptionId);
+          }
           clients.delete(ws);
           logger.info('Client unsubscribed from live tracking');
         }
@@ -287,12 +295,20 @@ export function createLiveWebSocketServer(
     });
 
     ws.on('close', () => {
+      const subscription = clients.get(ws);
+      if (subscription?.subscriptionId) {
+        readTransport.unsubscribe(subscription.subscriptionId);
+      }
       clients.delete(ws);
       logger.info('Live tracking WebSocket client disconnected');
     });
 
     ws.on('error', (err) => {
       logger.error({ err }, 'WebSocket client error');
+      const subscription = clients.get(ws);
+      if (subscription?.subscriptionId) {
+        readTransport.unsubscribe(subscription.subscriptionId);
+      }
       clients.delete(ws);
     });
   });

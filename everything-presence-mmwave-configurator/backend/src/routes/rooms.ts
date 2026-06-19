@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import { storage } from '../config/storage';
+import { deviceEntityService } from '../domain/deviceEntityService';
 import { DevicePlacement, Door, EntityMappings, FurnitureInstance, RoomConfig, RoomShell, ZoneRect, ZoneEntitySet, TargetEntitySet } from '../domain/types';
 
 export const createRoomsRouter = (): Router => {
@@ -33,11 +34,25 @@ export const createRoomsRouter = (): Router => {
     const x = Number(placement?.x ?? 0);
     const y = Number(placement?.y ?? 0);
     const rotationDeg = placement?.rotationDeg !== undefined ? Number(placement.rotationDeg) : undefined;
+    const heightMm = placement?.heightMm !== undefined ? Number(placement.heightMm) : undefined;
+    const pitchDeg = placement?.pitchDeg !== undefined ? Number(placement.pitchDeg) : undefined;
+    const coveragePresetId = typeof placement?.coveragePresetId === 'string' && placement.coveragePresetId.trim()
+      ? placement.coveragePresetId.trim()
+      : undefined;
+    const horizontalFovDeg = placement?.horizontalFovDeg !== undefined ? Number(placement.horizontalFovDeg) : undefined;
+    const verticalFovDeg = placement?.verticalFovDeg !== undefined ? Number(placement.verticalFovDeg) : undefined;
+    const mountType = placement?.mountType === 'ceiling' ? 'ceiling' : placement?.mountType === 'wall' ? 'wall' : undefined;
     if (!Number.isFinite(x) || !Number.isFinite(y)) return undefined;
     return {
       x,
       y,
       rotationDeg: Number.isFinite(rotationDeg) ? rotationDeg : undefined,
+      mountType,
+      heightMm: Number.isFinite(heightMm) ? heightMm : undefined,
+      pitchDeg: Number.isFinite(pitchDeg) ? pitchDeg : undefined,
+      coveragePresetId,
+      horizontalFovDeg: Number.isFinite(horizontalFovDeg) ? horizontalFovDeg : undefined,
+      verticalFovDeg: Number.isFinite(verticalFovDeg) ? verticalFovDeg : undefined,
     };
   };
 
@@ -142,7 +157,7 @@ export const createRoomsRouter = (): Router => {
       'presenceEntity', 'mmwaveEntity', 'pirEntity', 'temperatureEntity',
       'humidityEntity', 'illuminanceEntity', 'co2Entity', 'distanceEntity',
       'speedEntity', 'energyEntity', 'targetCountEntity', 'modeEntity',
-      'maxDistanceEntity', 'installationAngleEntity', 'polygonZonesEnabledEntity',
+      'maxDistanceEntity', 'installationAngleEntity', 'upsideDownMountingEntity', 'polygonZonesEnabledEntity',
       'trackingTargetCountEntity',
     ];
     for (const key of stringKeys) {
@@ -236,6 +251,22 @@ export const createRoomsRouter = (): Router => {
     metadata: body?.metadata ?? {},
   });
 
+  const applyDeviceMappingPrefix = (room: RoomConfig): RoomConfig => {
+    if (room.entityNamePrefix || !room.deviceId) {
+      return room;
+    }
+
+    const mappingPrefix = deviceEntityService.getDeviceNamePrefix(room.deviceId);
+    if (!mappingPrefix) {
+      return room;
+    }
+
+    return {
+      ...room,
+      entityNamePrefix: mappingPrefix,
+    };
+  };
+
   router.get('/', (_req, res) => {
     res.json({ rooms: storage.listRooms() });
   });
@@ -249,7 +280,7 @@ export const createRoomsRouter = (): Router => {
   });
 
   router.post('/', (req, res) => {
-    const room = normalizeRoom(req.body);
+    const room = applyDeviceMappingPrefix(normalizeRoom(req.body));
     storage.saveRoom(room);
     res.json({ room });
   });
@@ -259,7 +290,7 @@ export const createRoomsRouter = (): Router => {
     if (!existing) {
       return res.status(404).json({ message: 'Room not found' });
     }
-    const room = normalizeRoom({ ...existing, ...req.body }, existing.id);
+    const room = applyDeviceMappingPrefix(normalizeRoom({ ...existing, ...req.body }, existing.id));
     storage.saveRoom(room);
     return res.json({ room });
   });

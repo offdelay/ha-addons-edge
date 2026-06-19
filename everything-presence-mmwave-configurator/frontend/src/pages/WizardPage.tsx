@@ -8,13 +8,26 @@ import { FurnitureEditor } from '../components/FurnitureEditor';
 import { DoorEditor } from '../components/DoorEditor';
 import { ThemeSwitcher } from '../components/ThemeSwitcher';
 import { EntityDiscovery } from '../components/EntityDiscovery';
+import {
+  CanvasBottomToolbar,
+  CanvasMobileSheet,
+  CanvasToolbarButton,
+  CanvasTopBar,
+} from '../components/CanvasLayout';
+import { DisplaySettingsControls } from '../components/DisplaySettingsControls';
 import { updateRoom } from '../api/rooms';
 import { useWallDrawing } from '../hooks/useWallDrawing';
 import { pushZonesToDevice, fetchZonesFromDevice, fetchPolygonModeStatus, setPolygonMode, fetchPolygonZonesFromDevice, pushPolygonZonesToDevice, PolygonModeStatus } from '../api/zones';
-import { fetchZoneAvailability, ingressAware } from '../api/client';
+import { fetchMetaConfig, fetchZoneAvailability, ingressAware } from '../api/client';
 import { useDeviceMappings } from '../contexts/DeviceMappingsContext';
 import { getInstallationAngleSuggestion } from '../utils/rotationSuggestion';
 import { useDisplaySettings } from '../hooks/useDisplaySettings';
+import { useIsMobileCanvas } from '../hooks/useMediaQuery';
+import { getDeviceIconUrl } from '../utils/deviceIcon';
+import { resolveCoverageFov, resolveTrackingCoverageFov } from '../utils/coverage';
+import { formatSnapPresetLabel } from '../utils/snapLabels';
+import { usesPolygonOnlyZones } from '../utils/firmware';
+import { resolveEntityPrefix } from '../utils/entityUtils';
 
 interface WizardPageProps {
   devices: DiscoveredDevice[];
@@ -60,6 +73,8 @@ type StepKey =
   | 'zones'
   | 'finish';
 
+type MobileCanvasSheet = 'tools' | 'zoom' | 'display' | 'zones' | 'device' | null;
+
 export const WizardPage: React.FC<WizardPageProps> = ({
   devices,
   profiles,
@@ -94,6 +109,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
   const [error, setError] = useState<string | null>(null);
   const [pushingZones, setPushingZones] = useState(false);
   const [pushSuccess, setPushSuccess] = useState(false);
+  const [appVersion, setAppVersion] = useState<string>('unknown');
 
   // Entity discovery mappings (discovered after device selection)
   const [discoveredMappings, setDiscoveredMappings] = useState<EntityMappings | null>(null);
@@ -107,11 +123,26 @@ export const WizardPage: React.FC<WizardPageProps> = ({
   // Zone selection for embedded zone drawing
   const [selectedZoneId, setSelectedZoneId] = useState<string | null>(null);
 
-  // Radar overlay clipping toggle
-  const [clipRadarToWalls, setClipRadarToWalls] = useState(true);
+  useEffect(() => {
+    fetchMetaConfig()
+      .then((res) => setAppVersion(res.appVersion ?? 'unknown'))
+      .catch(() => null);
+  }, []);
 
   // Display settings for live tracking and device icon
-  const { showTargets, setShowTargets, showDeviceIcon, setShowDeviceIcon } = useDisplaySettings();
+  const {
+    showWalls, setShowWalls,
+    showFurniture, setShowFurniture,
+    showDoors, setShowDoors,
+    showZones, setShowZones,
+    showTargets, setShowTargets,
+    showDeviceIcon, setShowDeviceIcon,
+    showDeviceRadar, setShowDeviceRadar,
+    targetMarkerScale, setTargetMarkerScale,
+    showZoneLabels, setShowZoneLabels,
+    zoneLabelScale, setZoneLabelScale,
+    clipRadarToWalls, setClipRadarToWalls,
+  } = useDisplaySettings();
 
   // Cursor position tracking
   const [cursorPos, setCursorPos] = useState<{ x: number; y: number } | null>(null);
@@ -134,6 +165,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
   const [rotationSuggestion, setRotationSuggestion] = useState<{ suggestedAngle: number; targetAxis: number } | null>(null);
   const [applyingInstallationAngle, setApplyingInstallationAngle] = useState(false);
   const [rotationSuggestionError, setRotationSuggestionError] = useState<string | null>(null);
+  const [activeMobileCanvasSheet, setActiveMobileCanvasSheet] = useState<MobileCanvasSheet>(null);
   const lastRotationSuggestionRef = useRef<number | null>(null);
 
   // Track which rooms have had zones loaded to prevent redundant fetches
@@ -183,6 +215,29 @@ export const WizardPage: React.FC<WizardPageProps> = ({
     () => profiles.find((p) => p.id === (selectedRoom?.profileId ?? profileId ?? undefined)) ?? null,
     [profiles, profileId, selectedRoom?.profileId],
   );
+  const polygonOnlyZones = useMemo(() => (
+    usesPolygonOnlyZones(
+      selectedDevice?.firmwareVersion ?? null,
+      selectedDevice?.model ?? currentProfile?.label ?? null,
+    ) === true
+  ), [selectedDevice?.firmwareVersion, selectedDevice?.model, currentProfile?.label]);
+
+  const deviceIconUrl = useMemo(
+    () => getDeviceIconUrl(currentProfile, selectedRoom?.devicePlacement),
+    [currentProfile, selectedRoom?.devicePlacement],
+  );
+
+  const coverageFov = useMemo(
+    () => resolveCoverageFov(currentProfile, selectedRoom?.devicePlacement),
+    [currentProfile, selectedRoom?.devicePlacement],
+  );
+  const trackingCoverageFov = useMemo(
+    () => resolveTrackingCoverageFov(currentProfile),
+    [currentProfile],
+  );
+  const effectiveCoverageMaxRangeMeters = coverageFov?.maxRangeMeters ?? currentProfile?.limits?.maxRangeMeters;
+  const trackingMaxRangeMeters = trackingCoverageFov?.maxRangeMeters ?? currentProfile?.limits?.maxRangeMeters;
+  const trackingFieldOfViewDeg = trackingCoverageFov?.horizontalFovDeg ?? currentProfile?.limits?.fieldOfViewDegrees;
 
   const isEplDevice = useMemo(() => {
     const caps = currentProfile?.capabilities as { tracking?: boolean; distanceOnlyTracking?: boolean } | undefined;
@@ -191,6 +246,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
 
   // Device mappings context - used for entity resolution and validation
   const { hasValidMappings, getEntityId, getMapping } = useDeviceMappings();
+  const isMobileCanvas = useIsMobileCanvas();
 
   // Pre-load device mapping into cache when device is selected
   // This ensures getEntityId works for installation angle resolution
@@ -307,11 +363,13 @@ export const WizardPage: React.FC<WizardPageProps> = ({
         return;
       }
 
-      let entityNamePrefix = selectedRoom?.entityNamePrefix;
-      if (!entityNamePrefix) {
-        const device = devices.find(d => d.id === currentDeviceId);
-        entityNamePrefix = device?.entityNamePrefix;
-      }
+      const mapping = await getMapping(currentDeviceId);
+      const entityNamePrefix = resolveEntityPrefix({
+        entityMappings: selectedRoom?.entityMappings,
+        entityNamePrefix: selectedRoom?.entityNamePrefix,
+        mappingPrefix: mapping?.esphomeNodeName,
+        devicePrefix: devices.find((device) => device.id === currentDeviceId)?.entityNamePrefix,
+      });
 
       if (!entityNamePrefix) {
         setEntryZonesAvailable(null);
@@ -422,7 +480,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
   const displayZones = useMemo(() => {
     if (!selectedRoom) return allPossibleZones;
 
-    const deviceZones = selectedRoom.zones ?? [];
+    const deviceZones = polygonOnlyZones ? [] : selectedRoom.zones ?? [];
     const merged = [...allPossibleZones];
 
     // Match device zones to slots by type and index
@@ -434,7 +492,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
     });
 
     return merged;
-  }, [selectedRoom, allPossibleZones]);
+  }, [selectedRoom, allPossibleZones, polygonOnlyZones]);
 
   // Only enabled zones should show on canvas
   const enabledZones = useMemo(() => {
@@ -443,7 +501,8 @@ export const WizardPage: React.FC<WizardPageProps> = ({
 
   const handleDevicePlacementChange = useCallback(async (placement: DevicePlacement) => {
     if (!selectedRoom) return;
-    const updatedRoom: RoomConfig = { ...selectedRoom, devicePlacement: placement };
+    const basePlacement = selectedRoom.devicePlacement ?? { x: 0, y: 0, rotationDeg: 0 };
+    const updatedRoom: RoomConfig = { ...selectedRoom, devicePlacement: { ...basePlacement, ...placement } };
     // Optimistic update
     onRoomUpdate?.(updatedRoom);
     try {
@@ -491,6 +550,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
       await updateRoom(selectedRoom.id, updatedRoom);
       setSelectedFurnitureId(newFurniture.id);
       setShowFurnitureLibrary(false);
+      setActiveMobileCanvasSheet(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to add furniture');
       onRoomUpdate?.(selectedRoom);
@@ -758,7 +818,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
   useEffect(() => {
     if (currentStep === 'zones' && roomPath === 'skip' && selectedRoom && !selectedRoom.devicePlacement) {
       // Calculate offset to center device + FOV together
-      const maxRangeMeters = currentProfile?.limits?.maxRangeMeters ?? 6;
+      const maxRangeMeters = trackingMaxRangeMeters ?? 6;
       const maxRangeMm = maxRangeMeters * 1000;
       const offsetY = -maxRangeMm / 2; // Negative Y shifts upward
 
@@ -769,7 +829,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
         rotationDeg: 90,
       });
     }
-  }, [currentStep, roomPath, selectedRoom, currentProfile, handleDevicePlacementChange]);
+  }, [currentStep, roomPath, selectedRoom, trackingMaxRangeMeters, handleDevicePlacementChange]);
 
   // Load zones from device when entering zones step
   useEffect(() => {
@@ -783,12 +843,13 @@ export const WizardPage: React.FC<WizardPageProps> = ({
         return;
       }
 
-      // Get entityNamePrefix from room or fall back to device
-      let entityNamePrefix = selectedRoom.entityNamePrefix;
-      if (!entityNamePrefix) {
-        const device = devices.find(d => d.id === selectedRoom.deviceId);
-        entityNamePrefix = device?.entityNamePrefix;
-      }
+      const mapping = await getMapping(selectedRoom.deviceId);
+      const entityNamePrefix = resolveEntityPrefix({
+        entityMappings: selectedRoom.entityMappings,
+        entityNamePrefix: selectedRoom.entityNamePrefix,
+        mappingPrefix: mapping?.esphomeNodeName,
+        devicePrefix: devices.find((device) => device.id === selectedRoom.deviceId)?.entityNamePrefix,
+      });
 
       if (!entityNamePrefix) {
         console.warn('Cannot load zones: entityNamePrefix not found for room or device');
@@ -810,6 +871,10 @@ export const WizardPage: React.FC<WizardPageProps> = ({
       zonesLoadedRef.current.add(roomKey);
 
       try {
+        if (polygonOnlyZones) {
+          setZonesLoadingComplete(roomKey);
+          return;
+        }
         // Skip entityMappings if device has valid mappings stored
         const entityMappingsToUse = deviceHasValidMappings ? undefined : selectedRoom.entityMappings;
         // fetchZonesFromDevice returns ZoneRect[] directly, not { zones: ZoneRect[] }
@@ -827,6 +892,11 @@ export const WizardPage: React.FC<WizardPageProps> = ({
           setZonesLoadingComplete(roomKey);
         }, 0);
       } catch (err) {
+        // Preserve stored rectangles for polygon-only recovery flows.
+        if (polygonOnlyZones) {
+          setZonesLoadingComplete(roomKey);
+          return;
+        }
         // Clear zones on error to prevent showing stale zones
         const updatedRoom: RoomConfig = { ...selectedRoom, zones: [] };
         await updateRoom(selectedRoom.id, updatedRoom);
@@ -839,7 +909,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
     };
 
     loadZonesFromDevice();
-  }, [currentStep, selectedRoom?.id, selectedRoom?.deviceId, selectedRoom?.profileId, selectedRoom?.entityNamePrefix, selectedRoom?.entityMappings, deviceId, devices, onRoomUpdate, deviceHasValidMappings]);
+  }, [currentStep, selectedRoom?.id, selectedRoom?.deviceId, selectedRoom?.profileId, selectedRoom?.entityNamePrefix, selectedRoom?.entityMappings, deviceId, devices, onRoomUpdate, deviceHasValidMappings, polygonOnlyZones]);
 
   // Fetch polygon mode status when entering zones step
   // This runs AFTER zones have been loaded to ensure room is fully initialized
@@ -856,11 +926,13 @@ export const WizardPage: React.FC<WizardPageProps> = ({
         return;
       }
 
-      let entityNamePrefix = selectedRoom.entityNamePrefix;
-      if (!entityNamePrefix) {
-        const device = devices.find(d => d.id === selectedRoom.deviceId);
-        entityNamePrefix = device?.entityNamePrefix;
-      }
+      const mapping = await getMapping(selectedRoom.deviceId);
+      const entityNamePrefix = resolveEntityPrefix({
+        entityMappings: selectedRoom.entityMappings,
+        entityNamePrefix: selectedRoom.entityNamePrefix,
+        mappingPrefix: mapping?.esphomeNodeName,
+        devicePrefix: devices.find((device) => device.id === selectedRoom.deviceId)?.entityNamePrefix,
+      });
 
       if (!entityNamePrefix) {
         setPolygonModeStatus({ supported: false, enabled: false, controllable: false });
@@ -870,12 +942,18 @@ export const WizardPage: React.FC<WizardPageProps> = ({
       try {
         // Skip entityMappings if device has valid mappings stored
         const entityMappingsToUse = deviceHasValidMappings ? undefined : selectedRoom.entityMappings;
-        const status = await fetchPolygonModeStatus(
+        let status = await fetchPolygonModeStatus(
           selectedRoom.deviceId,
           selectedRoom.profileId,
           entityNamePrefix,
           entityMappingsToUse
         );
+        // Polygon-only firmware has no rectangle mode: never let a stale mode toggle
+        // (e.g. a ghost switch entity left behind by the firmware update) push the
+        // wizard into rectangle mode, where zone slots can't be enabled.
+        if (polygonOnlyZones && (!status.enabled || !status.supported)) {
+          status = { supported: true, enabled: true, controllable: false };
+        }
         setPolygonModeStatus(status);
 
         // If polygon mode is enabled, fetch polygon zones
@@ -901,12 +979,16 @@ export const WizardPage: React.FC<WizardPageProps> = ({
         // entities do exist.
       } catch (err) {
         console.error('Failed to fetch polygon mode status:', err);
-        setPolygonModeStatus({ supported: false, enabled: false, controllable: false });
+        if (polygonOnlyZones) {
+          setPolygonModeStatus({ supported: true, enabled: true, controllable: false });
+        } else {
+          setPolygonModeStatus({ supported: false, enabled: false, controllable: false });
+        }
       }
     };
 
     loadPolygonModeStatus();
-  }, [currentStep, selectedRoom?.id, selectedRoom?.deviceId, selectedRoom?.profileId, selectedRoom?.entityNamePrefix, selectedRoom?.entityMappings, devices, zonesLoadingComplete, deviceHasValidMappings]);
+  }, [currentStep, selectedRoom?.id, selectedRoom?.deviceId, selectedRoom?.profileId, selectedRoom?.entityNamePrefix, selectedRoom?.entityMappings, devices, zonesLoadingComplete, deviceHasValidMappings, polygonOnlyZones]);
 
   // Track if we've auto-enabled Zone 1 for this room to avoid re-enabling if user manually disables
   const autoEnabledZoneRef = useRef<Set<string>>(new Set());
@@ -1040,8 +1122,11 @@ export const WizardPage: React.FC<WizardPageProps> = ({
     }
   };
 
-  const handleEntityDiscoveryComplete = (mappings: EntityMappings) => {
+  const handleEntityDiscoveryComplete = (mappings: EntityMappings, savedMapping: { profileId: string }) => {
     setDiscoveredMappings(mappings);
+    if (savedMapping.profileId) {
+      setProfileId(savedMapping.profileId);
+    }
     nextStep();
   };
 
@@ -1115,12 +1200,13 @@ export const WizardPage: React.FC<WizardPageProps> = ({
       return;
     }
 
-    // Get entityNamePrefix from room or device
-    let entityNamePrefix = selectedRoom?.entityNamePrefix;
-    if (!entityNamePrefix) {
-      const device = devices.find(d => d.id === deviceId);
-      entityNamePrefix = device?.entityNamePrefix;
-    }
+    const mapping = await getMapping(deviceId);
+    const entityNamePrefix = resolveEntityPrefix({
+      entityMappings: selectedRoom?.entityMappings,
+      entityNamePrefix: selectedRoom?.entityNamePrefix,
+      mappingPrefix: mapping?.esphomeNodeName,
+      devicePrefix: devices.find((device) => device.id === deviceId)?.entityNamePrefix,
+    });
 
     if (!entityNamePrefix) {
       setError('Cannot push zones: device entity name prefix not found');
@@ -1163,11 +1249,13 @@ export const WizardPage: React.FC<WizardPageProps> = ({
   const handleEnablePolygonMode = async () => {
     if (!selectedRoom?.deviceId || !selectedRoom?.profileId) return;
 
-    let entityNamePrefix = selectedRoom.entityNamePrefix;
-    if (!entityNamePrefix) {
-      const device = devices.find(d => d.id === selectedRoom.deviceId);
-      entityNamePrefix = device?.entityNamePrefix;
-    }
+    const mapping = await getMapping(selectedRoom.deviceId);
+    const entityNamePrefix = resolveEntityPrefix({
+      entityMappings: selectedRoom.entityMappings,
+      entityNamePrefix: selectedRoom.entityNamePrefix,
+      mappingPrefix: mapping?.esphomeNodeName,
+      devicePrefix: devices.find((device) => device.id === selectedRoom.deviceId)?.entityNamePrefix,
+    });
 
     if (!entityNamePrefix) {
       setError('Cannot enable polygon mode: device entity name prefix not found');
@@ -1275,6 +1363,12 @@ export const WizardPage: React.FC<WizardPageProps> = ({
     }
   }, [currentStep]);
 
+  useEffect(() => {
+    if (!isMobileCanvas) {
+      setActiveMobileCanvasSheet(null);
+    }
+  }, [isMobileCanvas]);
+
   // If canvas step, render full-page canvas mode
   if (isCanvasStep) {
     const getStepInfo = () => {
@@ -1293,6 +1387,19 @@ export const WizardPage: React.FC<WizardPageProps> = ({
     };
 
     const stepInfo = getStepInfo();
+    const openMobileSheet = (sheet: MobileCanvasSheet) => {
+      setActiveMobileCanvasSheet((current) => current === sheet ? null : sheet);
+    };
+    const resetCanvasView = () => {
+      setCanvasZoom(1);
+      setCanvasPan({ x: 0, y: 0 });
+    };
+    const showDisplaySheet = currentStep === 'doors' || currentStep === 'furniture' || currentStep === 'placement' || currentStep === 'zones';
+    const showToolsSheet = currentStep === 'outline' || currentStep === 'doors' || currentStep === 'furniture';
+    const showDeviceSheet = currentStep === 'placement';
+    const showZonesSheet = currentStep === 'zones';
+    const mobileZonesBadge = polygonModeStatus.enabled ? polygonZones.length : `${enabledZones.length}/${displayZones.length}`;
+    const currentRoomName = selectedRoom?.name ?? 'Setup Wizard';
 
     return (
       <div className="fixed inset-0 bg-slate-950 overflow-hidden">
@@ -1368,8 +1475,44 @@ export const WizardPage: React.FC<WizardPageProps> = ({
           </div>
         )}
 
+        <div className="md:hidden">
+          <CanvasTopBar
+            left={
+              <button
+                type="button"
+                onClick={prevStep}
+                disabled={stepIndex === 0}
+                className="min-h-[40px] rounded-lg border border-slate-700 bg-slate-900 px-3 text-sm font-semibold text-slate-100 disabled:opacity-40"
+              >
+                Back
+              </button>
+            }
+            title={stepInfo.title}
+            subtitle={`${currentRoomName} · Step ${stepIndex + 1} of ${steps.length}`}
+            right={
+              canNext ? (
+                <button
+                  type="button"
+                  onClick={nextStep}
+                  className="min-h-[40px] rounded-lg bg-aqua-600 px-4 text-sm font-bold text-white"
+                >
+                  Next
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setShowWelcomePopup(true)}
+                  className="min-h-[40px] rounded-lg border border-slate-700 bg-slate-900 px-3 text-sm font-semibold text-slate-100"
+                >
+                  Info
+                </button>
+              )
+            }
+          />
+        </div>
+
         {/* Floating Navigation Controls */}
-        <div className="absolute top-6 left-6 z-40 flex items-center gap-3">
+        <div className="absolute top-6 left-6 z-40 hidden items-center gap-3 md:flex">
           <button
             onClick={prevStep}
             disabled={stepIndex === 0}
@@ -1383,7 +1526,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
         </div>
 
         {/* Floating Exit & Restart Buttons (top right) */}
-        <div className="absolute top-6 right-6 z-40 flex items-center gap-3">
+        <div className="absolute top-6 right-6 z-40 hidden items-center gap-3 md:flex">
           {onBack && (
             <button
               onClick={onBack}
@@ -1443,8 +1586,10 @@ export const WizardPage: React.FC<WizardPageProps> = ({
               zoom={canvasZoom}
               panOffsetMm={canvasPan}
               onPanChange={setCanvasPan}
-              onDragStateChange={setIsCanvasDragging}
+              onZoomChange={setCanvasZoom}
+              touchPanEnabled={!isDrawingWall}
               displayUnits={units}
+              showWalls={showWalls}
             />
           )}
 
@@ -1459,6 +1604,8 @@ export const WizardPage: React.FC<WizardPageProps> = ({
               zoom={canvasZoom}
               panOffsetMm={canvasPan}
               onPanChange={setCanvasPan}
+              onZoomChange={setCanvasZoom}
+              touchPanEnabled={!isDoorPlacementMode}
               onDragStateChange={setIsCanvasDragging}
               displayUnits={units}
               doors={selectedRoom?.doors ?? []}
@@ -1470,11 +1617,13 @@ export const WizardPage: React.FC<WizardPageProps> = ({
               onDoorDragStart={handleDoorDragStart}
               onDoorDragMove={handleDoorDragMove}
               onDoorDragEnd={handleDoorDragEnd}
-              showDoors={true}
+              showWalls={showWalls}
+              showDoors={showDoors}
               devicePlacement={showDeviceIcon ? selectedRoom?.devicePlacement : undefined}
-              fieldOfViewDeg={currentProfile?.limits?.fieldOfViewDegrees}
-              maxRangeMeters={currentProfile?.limits?.maxRangeMeters}
-              deviceIconUrl={currentProfile?.iconUrl}
+              fieldOfViewDeg={trackingFieldOfViewDeg}
+              maxRangeMeters={trackingMaxRangeMeters}
+              deviceIconUrl={deviceIconUrl}
+                showRadar={showDeviceRadar}
               clipRadarToWalls={clipRadarToWalls}
               renderOverlay={({ toCanvas }) => {
                 if (!showTargets || !targetPositions?.length) return null;
@@ -1490,9 +1639,9 @@ export const WizardPage: React.FC<WizardPageProps> = ({
                       const colors = targetColors[idx % targetColors.length];
                       return (
                         <g key={target.id}>
-                          <circle cx={pos.x} cy={pos.y} r={25} fill={colors.fillOpacity} stroke={colors.fill} strokeWidth={1.5} />
-                          <circle cx={pos.x} cy={pos.y} r={10} fill={colors.fill} />
-                          <text x={pos.x} y={pos.y - 35} fill={colors.fill} fontSize="12" fontWeight="600" textAnchor="middle">T{target.id}</text>
+                          <circle cx={pos.x} cy={pos.y} r={25 * targetMarkerScale} fill={colors.fillOpacity} stroke={colors.fill} strokeWidth={1.5 * targetMarkerScale} />
+                          <circle cx={pos.x} cy={pos.y} r={10 * targetMarkerScale} fill={colors.fill} />
+                          <text x={pos.x} y={pos.y - (35 * targetMarkerScale)} fill={colors.fill} fontSize={12 * targetMarkerScale} fontWeight="600" textAnchor="middle">T{target.id}</text>
                         </g>
                       );
                     })}
@@ -1513,10 +1662,13 @@ export const WizardPage: React.FC<WizardPageProps> = ({
               zoom={canvasZoom}
               panOffsetMm={canvasPan}
               onPanChange={setCanvasPan}
+              onZoomChange={setCanvasZoom}
+              touchPanEnabled
               onDragStateChange={setIsCanvasDragging}
               displayUnits={units}
               doors={selectedRoom?.doors ?? []}
-              showDoors={true}
+              showWalls={showWalls}
+              showDoors={showDoors}
               furniture={selectedRoom?.furniture ?? []}
               selectedFurnitureId={selectedFurnitureId}
               onFurnitureSelect={(id) => {
@@ -1524,11 +1676,12 @@ export const WizardPage: React.FC<WizardPageProps> = ({
                 setShowFurnitureLibrary(false);
               }}
               onFurnitureChange={handleFurnitureChange}
-              showFurniture={true}
+              showFurniture={showFurniture}
               devicePlacement={showDeviceIcon ? selectedRoom?.devicePlacement : undefined}
-              fieldOfViewDeg={currentProfile?.limits?.fieldOfViewDegrees}
-              maxRangeMeters={currentProfile?.limits?.maxRangeMeters}
-              deviceIconUrl={currentProfile?.iconUrl}
+              fieldOfViewDeg={trackingFieldOfViewDeg}
+              maxRangeMeters={trackingMaxRangeMeters}
+              deviceIconUrl={deviceIconUrl}
+              showRadar={showDeviceRadar}
               clipRadarToWalls={clipRadarToWalls}
               renderOverlay={({ toCanvas }) => {
                 if (!showTargets || !targetPositions?.length) return null;
@@ -1544,9 +1697,9 @@ export const WizardPage: React.FC<WizardPageProps> = ({
                       const colors = targetColors[idx % targetColors.length];
                       return (
                         <g key={target.id}>
-                          <circle cx={pos.x} cy={pos.y} r={25} fill={colors.fillOpacity} stroke={colors.fill} strokeWidth={1.5} />
-                          <circle cx={pos.x} cy={pos.y} r={10} fill={colors.fill} />
-                          <text x={pos.x} y={pos.y - 35} fill={colors.fill} fontSize="12" fontWeight="600" textAnchor="middle">T{target.id}</text>
+                          <circle cx={pos.x} cy={pos.y} r={25 * targetMarkerScale} fill={colors.fillOpacity} stroke={colors.fill} strokeWidth={1.5 * targetMarkerScale} />
+                          <circle cx={pos.x} cy={pos.y} r={10 * targetMarkerScale} fill={colors.fill} />
+                          <text x={pos.x} y={pos.y - (35 * targetMarkerScale)} fill={colors.fill} fontSize={12 * targetMarkerScale} fontWeight="600" textAnchor="middle">T{target.id}</text>
                         </g>
                       );
                     })}
@@ -1569,9 +1722,10 @@ export const WizardPage: React.FC<WizardPageProps> = ({
                 }
               }
               onDeviceChange={handleDevicePlacementChange}
-              fieldOfViewDeg={currentProfile?.limits?.fieldOfViewDegrees}
-              maxRangeMeters={currentProfile?.limits?.maxRangeMeters}
-              deviceIconUrl={currentProfile?.iconUrl}
+              fieldOfViewDeg={trackingFieldOfViewDeg}
+              maxRangeMeters={trackingMaxRangeMeters}
+              deviceIconUrl={deviceIconUrl}
+              showRadar={showDeviceRadar}
               clipRadarToWalls={clipRadarToWalls}
               rangeMm={15000}
               snapGridMm={canvasSnap}
@@ -1579,11 +1733,14 @@ export const WizardPage: React.FC<WizardPageProps> = ({
               zoom={canvasZoom}
               panOffsetMm={canvasPan}
               onPanChange={setCanvasPan}
+              onZoomChange={setCanvasZoom}
+              touchPanEnabled
               displayUnits={units}
               furniture={selectedRoom?.furniture ?? []}
-              showFurniture={true}
+              showWalls={showWalls}
+              showFurniture={showFurniture}
               doors={selectedRoom?.doors ?? []}
-              showDoors={true}
+              showDoors={showDoors}
               renderOverlay={({ toCanvas }) => {
                 if (!showTargets || !targetPositions?.length) return null;
                 const targetColors = [
@@ -1598,9 +1755,9 @@ export const WizardPage: React.FC<WizardPageProps> = ({
                       const colors = targetColors[idx % targetColors.length];
                       return (
                         <g key={target.id}>
-                          <circle cx={pos.x} cy={pos.y} r={25} fill={colors.fillOpacity} stroke={colors.fill} strokeWidth={1.5} />
-                          <circle cx={pos.x} cy={pos.y} r={10} fill={colors.fill} />
-                          <text x={pos.x} y={pos.y - 35} fill={colors.fill} fontSize="12" fontWeight="600" textAnchor="middle">T{target.id}</text>
+                          <circle cx={pos.x} cy={pos.y} r={25 * targetMarkerScale} fill={colors.fillOpacity} stroke={colors.fill} strokeWidth={1.5 * targetMarkerScale} />
+                          <circle cx={pos.x} cy={pos.y} r={10 * targetMarkerScale} fill={colors.fill} />
+                          <text x={pos.x} y={pos.y - (35 * targetMarkerScale)} fill={colors.fill} fontSize={12 * targetMarkerScale} fontWeight="600" textAnchor="middle">T{target.id}</text>
                         </g>
                       );
                     })}
@@ -1653,19 +1810,29 @@ export const WizardPage: React.FC<WizardPageProps> = ({
                 roomShell={isRoomMode ? selectedRoom?.roomShell : undefined}
                 devicePlacement={selectedRoom?.devicePlacement} // Always show device placement, even in skip mode
                 installationAngle={liveState?.config?.installationAngle}
-                fieldOfViewDeg={currentProfile?.limits?.fieldOfViewDegrees}
-                maxRangeMeters={currentProfile?.limits?.maxRangeMeters}
-                deviceIconUrl={currentProfile?.iconUrl}
+                fieldOfViewDeg={trackingFieldOfViewDeg}
+                maxRangeMeters={trackingMaxRangeMeters}
+                deviceIconUrl={deviceIconUrl}
+              showRadar={showDeviceRadar}
                 rangeMm={15000}
                 snapGridMm={canvasSnap}
                 height="100%"
                 zoom={canvasZoom}
                 panOffsetMm={canvasPan}
                 onPanChange={setCanvasPan}
+                onZoomChange={setCanvasZoom}
+                touchPanEnabled={!isCanvasDragging}
                 onCanvasMove={(pt) => setCursorPos(pt)}
                 clipRadarToWalls={clipRadarToWalls}
                 furniture={selectedRoom?.furniture}
                 doors={selectedRoom?.doors}
+                showWalls={showWalls}
+                showFurniture={showFurniture}
+                showDoors={showDoors}
+                showZones={showZones}
+                showDevice={showDeviceIcon}
+                showZoneLabels={showZoneLabels}
+                zoneLabelScale={zoneLabelScale}
                 renderOverlay={({ toCanvas }) => {
                   if (!showTargets || !targetPositions?.length) return null;
                   const targetColors = [
@@ -1680,9 +1847,9 @@ export const WizardPage: React.FC<WizardPageProps> = ({
                         const colors = targetColors[idx % targetColors.length];
                         return (
                           <g key={target.id}>
-                            <circle cx={pos.x} cy={pos.y} r={25} fill={colors.fillOpacity} stroke={colors.fill} strokeWidth={1.5} />
-                            <circle cx={pos.x} cy={pos.y} r={10} fill={colors.fill} />
-                            <text x={pos.x} y={pos.y - 35} fill={colors.fill} fontSize="12" fontWeight="600" textAnchor="middle">T{target.id}</text>
+                            <circle cx={pos.x} cy={pos.y} r={25 * targetMarkerScale} fill={colors.fillOpacity} stroke={colors.fill} strokeWidth={1.5 * targetMarkerScale} />
+                            <circle cx={pos.x} cy={pos.y} r={10 * targetMarkerScale} fill={colors.fill} />
+                            <text x={pos.x} y={pos.y - (35 * targetMarkerScale)} fill={colors.fill} fontSize={12 * targetMarkerScale} fontWeight="600" textAnchor="middle">T{target.id}</text>
                           </g>
                         );
                       })}
@@ -1694,7 +1861,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
           )}
 
           {/* Floating Zoom Controls (bottom right) */}
-          <div className="absolute bottom-6 right-6 z-40 flex flex-col gap-2">
+          <div className="absolute bottom-6 right-6 z-40 hidden flex-col gap-2 md:flex">
             <button
               onClick={() => setCanvasZoom((z) => Math.min(5, z + 0.2))}
               className="rounded-xl border border-slate-700/50 bg-slate-900/90 backdrop-blur px-4 py-2.5 text-sm font-semibold text-slate-100 shadow-lg transition-all hover:border-slate-600 hover:bg-slate-800 hover:shadow-xl active:scale-95"
@@ -1727,7 +1894,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
           </div>
 
           {/* Floating Snap Controls (bottom left) */}
-          <div className="absolute bottom-6 left-6 z-40 flex flex-col gap-2 rounded-xl border border-slate-700/50 bg-slate-900/90 backdrop-blur px-4 py-3 shadow-xl">
+          <div className="absolute bottom-6 left-6 z-40 hidden flex-col gap-2 rounded-xl border border-slate-700/50 bg-slate-900/90 backdrop-blur px-4 py-3 shadow-xl md:flex">
             <span className="text-xs text-slate-400 font-medium">Snap Grid</span>
             <div className="flex flex-wrap gap-2">
               {[0, 50, 100, 200].map((v) => (
@@ -1740,7 +1907,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
                       : 'border-slate-700 bg-slate-800/50 text-slate-200 hover:border-slate-600'
                   }`}
                 >
-                  {v === 0 ? 'Off' : `${v}mm`}
+                  {formatSnapPresetLabel(v, units)}
                 </button>
               ))}
             </div>
@@ -1754,7 +1921,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
 
           {/* Wall Drawing Controls (outline step only) */}
           {currentStep === 'outline' && (
-            <div className="absolute top-24 left-6 z-40 flex flex-col gap-2">
+            <div className="absolute top-24 left-6 z-40 hidden flex-col gap-2 md:flex">
               <button
                 className={`rounded-xl border px-4 py-2.5 text-sm font-semibold shadow-lg transition-all active:scale-95 ${
                   isDrawingWall
@@ -1791,7 +1958,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
 
           {/* Door Controls (doors step only) */}
           {currentStep === 'doors' && (
-            <div className="absolute top-24 left-6 z-40 flex flex-col gap-2">
+            <div className="absolute top-24 left-6 z-40 hidden flex-col gap-2 md:flex">
               <button
                 className={`rounded-xl border px-4 py-2.5 text-sm font-semibold shadow-lg transition-all active:scale-95 ${
                   isDoorPlacementMode
@@ -1846,7 +2013,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
 
           {/* Furniture Controls (furniture step only) */}
           {currentStep === 'furniture' && (
-            <div className="absolute top-24 left-6 z-40 flex flex-col gap-2">
+            <div className="absolute top-24 left-6 z-40 hidden flex-col gap-2 md:flex">
               <button
                 className={`rounded-xl border px-4 py-2.5 text-sm font-semibold shadow-lg transition-all active:scale-95 ${
                   showFurnitureLibrary
@@ -1899,7 +2066,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
 
           {/* Zone List Toggle Button (zones step only) */}
           {currentStep === 'zones' && (
-            <div className="absolute top-24 left-6 z-40 space-y-3">
+            <div className="absolute top-24 left-6 z-40 hidden space-y-3 md:block">
               <button
                 className={`rounded-xl border backdrop-blur px-6 py-3 text-sm font-semibold shadow-lg transition-all hover:shadow-xl active:scale-95 ${
                   polygonModeStatus.enabled
@@ -1979,7 +2146,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
 
           {/* Rotation Control (placement step only) */}
           {currentStep === 'placement' && selectedRoom?.devicePlacement && (
-            <div className="absolute top-24 left-6 z-40 space-y-3">
+            <div className="absolute top-24 left-6 z-40 hidden space-y-3 md:block">
               <div className="rounded-xl border border-slate-700/50 bg-slate-900/90 backdrop-blur p-4 shadow-lg">
                 <label className="flex items-center gap-3 text-xs text-slate-200">
                   <span className="font-semibold text-slate-300">Rotation:</span>
@@ -2023,7 +2190,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
           {canNext && (
             <button
               onClick={nextStep}
-              className="absolute bottom-6 left-1/2 -translate-x-1/2 z-40 group rounded-xl bg-gradient-to-r from-aqua-600 to-aqua-500 px-8 py-3 text-sm font-bold text-white shadow-xl shadow-aqua-500/30 transition-all hover:shadow-2xl hover:shadow-aqua-500/40 active:scale-95"
+              className="absolute bottom-6 left-1/2 z-40 hidden -translate-x-1/2 rounded-xl bg-gradient-to-r from-aqua-600 to-aqua-500 px-8 py-3 text-sm font-bold text-white shadow-xl shadow-aqua-500/30 transition-all hover:shadow-2xl hover:shadow-aqua-500/40 active:scale-95 md:block"
             >
               <span className="flex items-center gap-2">
                 Next <span className="inline-block transition-transform group-hover:translate-x-1">→</span>
@@ -2031,9 +2198,392 @@ export const WizardPage: React.FC<WizardPageProps> = ({
             </button>
           )}
 
+          <div className="md:hidden">
+            <CanvasBottomToolbar>
+              <CanvasToolbarButton
+                label="Info"
+                icon="i"
+                active={showWelcomePopup}
+                onClick={() => setShowWelcomePopup(true)}
+              />
+              {showToolsSheet && (
+                <CanvasToolbarButton
+                  label="Tools"
+                  icon="T"
+                  active={activeMobileCanvasSheet === 'tools'}
+                  onClick={() => openMobileSheet('tools')}
+                />
+              )}
+              {showDeviceSheet && (
+                <CanvasToolbarButton
+                  label="Device"
+                  icon="D"
+                  active={activeMobileCanvasSheet === 'device'}
+                  onClick={() => openMobileSheet('device')}
+                />
+              )}
+              {showZonesSheet && (
+                <CanvasToolbarButton
+                  label="Zones"
+                  icon="Z"
+                  badge={mobileZonesBadge}
+                  active={activeMobileCanvasSheet === 'zones'}
+                  onClick={() => openMobileSheet('zones')}
+                />
+              )}
+              {showDisplaySheet && (
+                <CanvasToolbarButton
+                  label="Display"
+                  icon="V"
+                  active={activeMobileCanvasSheet === 'display'}
+                  onClick={() => openMobileSheet('display')}
+                />
+              )}
+              <CanvasToolbarButton
+                label="Zoom"
+                icon="+"
+                active={activeMobileCanvasSheet === 'zoom'}
+                onClick={() => openMobileSheet('zoom')}
+              />
+            </CanvasBottomToolbar>
+
+            <CanvasMobileSheet
+              open={activeMobileCanvasSheet === 'tools'}
+              title="Tools"
+              description={stepInfo.title}
+              onClose={() => setActiveMobileCanvasSheet(null)}
+            >
+              {currentStep === 'outline' && (
+                <div className="space-y-3">
+                  <button
+                    className={`w-full rounded-lg border px-4 py-3 text-sm font-semibold ${
+                      isDrawingWall
+                        ? 'border-rose-600/50 bg-rose-600/20 text-rose-100'
+                        : 'border-aqua-600/50 bg-aqua-600/20 text-aqua-100'
+                    }`}
+                    onClick={() => setIsDrawingWall((prev) => !prev)}
+                  >
+                    {isDrawingWall ? 'Stop Drawing' : 'Add Wall'}
+                  </button>
+                  <div className="grid grid-cols-3 gap-2">
+                    <button
+                      className="rounded-lg border border-emerald-600/50 bg-emerald-600/20 px-3 py-3 text-sm font-semibold text-emerald-100 disabled:opacity-40"
+                      onClick={handleCloseLoop}
+                      disabled={!selectedRoom || (selectedRoom.roomShell?.points?.length ?? 0) < 2}
+                    >
+                      Finish
+                    </button>
+                    <button
+                      className="rounded-lg border border-amber-600/50 bg-amber-600/20 px-3 py-3 text-sm font-semibold text-amber-100 disabled:opacity-40"
+                      onClick={removeLastPoint}
+                      disabled={!selectedRoom || !(selectedRoom.roomShell?.points?.length)}
+                    >
+                      Undo
+                    </button>
+                    <button
+                      className="rounded-lg border border-rose-600/50 bg-rose-600/20 px-3 py-3 text-sm font-semibold text-rose-100 disabled:opacity-40"
+                      onClick={handleClear}
+                      disabled={!selectedRoom}
+                    >
+                      Clear
+                    </button>
+                  </div>
+                  <div className="rounded-lg border border-slate-700 bg-slate-800/50 p-3 text-xs text-slate-300">
+                    Points: {selectedRoom?.roomShell?.points?.length ?? 0}
+                  </div>
+                </div>
+              )}
+              {currentStep === 'doors' && (
+                <div className="space-y-3">
+                  <button
+                    className={`w-full rounded-lg border px-4 py-3 text-sm font-semibold ${
+                      isDoorPlacementMode
+                        ? 'border-rose-600/50 bg-rose-600/20 text-rose-100'
+                        : 'border-aqua-600/50 bg-aqua-600/20 text-aqua-100'
+                    }`}
+                    onClick={handleAddDoor}
+                    disabled={!selectedRoom || !selectedRoom.roomShell?.points || selectedRoom.roomShell.points.length < 3}
+                  >
+                    {isDoorPlacementMode ? 'Cancel Door Placement' : 'Add Door'}
+                  </button>
+                  <div className="rounded-lg border border-slate-700 bg-slate-800/50 p-3 text-xs text-slate-300">
+                    {selectedRoom?.doors?.length ?? 0} door{(selectedRoom?.doors?.length ?? 0) === 1 ? '' : 's'} placed
+                  </div>
+                </div>
+              )}
+              {currentStep === 'furniture' && (
+                <div className="space-y-3">
+                  <button
+                    className="w-full rounded-lg border border-aqua-600/50 bg-aqua-600/20 px-4 py-3 text-sm font-semibold text-aqua-100 disabled:opacity-40"
+                    onClick={() => {
+                      setShowFurnitureLibrary((v) => !v);
+                      setSelectedFurnitureId(null);
+                    }}
+                    disabled={!selectedRoom}
+                  >
+                    {showFurnitureLibrary ? 'Close Furniture Library' : 'Add Furniture'}
+                  </button>
+                  <div className="rounded-lg border border-slate-700 bg-slate-800/50 p-3 text-xs text-slate-300">
+                    {selectedRoom?.furniture?.length ?? 0} item{(selectedRoom?.furniture?.length ?? 0) === 1 ? '' : 's'} placed
+                  </div>
+                  {selectedFurniture && (
+                    <div className="space-y-3 rounded-lg border border-purple-600/40 bg-purple-600/10 p-3 text-sm text-slate-200">
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <div className="font-semibold text-white">Selected furniture</div>
+                          <div className="text-xs text-slate-400">{selectedFurniture.typeId}</div>
+                        </div>
+                        <button
+                          type="button"
+                          className="rounded-md border border-slate-700 px-3 py-2 text-xs font-semibold text-slate-100"
+                          onClick={() => setSelectedFurnitureId(null)}
+                        >
+                          Deselect
+                        </button>
+                      </div>
+                      <label className="block">
+                        <span className="mb-2 flex items-center justify-between text-xs font-semibold uppercase tracking-wide text-slate-400">
+                          <span>Rotation</span>
+                          <span className="font-mono text-aqua-300">{Math.round(selectedFurniture.rotationDeg ?? 0)} deg</span>
+                        </span>
+                        <input
+                          type="range"
+                          min="0"
+                          max="359"
+                          value={selectedFurniture.rotationDeg ?? 0}
+                          onChange={(e) => handleFurnitureChange({ ...selectedFurniture, rotationDeg: Number(e.target.value) })}
+                          className="w-full"
+                        />
+                      </label>
+                      <div className="grid grid-cols-2 gap-2">
+                        <label className="block text-xs font-semibold text-slate-400">
+                          Width (m)
+                          <input
+                            type="number"
+                            min="0.1"
+                            step="0.1"
+                            value={(selectedFurniture.width / 1000).toFixed(2)}
+                            onChange={(e) => {
+                              const width = Number(e.target.value) * 1000;
+                              if (Number.isFinite(width) && width > 0) {
+                                handleFurnitureChange({ ...selectedFurniture, width });
+                              }
+                            }}
+                            className="mt-1 w-full rounded-md border border-slate-700 bg-slate-900 px-2 py-2 text-sm text-slate-100"
+                          />
+                        </label>
+                        <label className="block text-xs font-semibold text-slate-400">
+                          Depth (m)
+                          <input
+                            type="number"
+                            min="0.1"
+                            step="0.1"
+                            value={(selectedFurniture.depth / 1000).toFixed(2)}
+                            onChange={(e) => {
+                              const depth = Number(e.target.value) * 1000;
+                              if (Number.isFinite(depth) && depth > 0) {
+                                handleFurnitureChange({ ...selectedFurniture, depth });
+                              }
+                            }}
+                            className="mt-1 w-full rounded-md border border-slate-700 bg-slate-900 px-2 py-2 text-sm text-slate-100"
+                          />
+                        </label>
+                      </div>
+                      <button
+                        type="button"
+                        className="w-full rounded-lg border border-rose-600/60 bg-rose-600/20 px-3 py-3 font-semibold text-rose-100"
+                        onClick={handleFurnitureDelete}
+                      >
+                        Delete Furniture
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+            </CanvasMobileSheet>
+
+            <CanvasMobileSheet
+              open={activeMobileCanvasSheet === 'device'}
+              title="Device"
+              description="Placement"
+              onClose={() => setActiveMobileCanvasSheet(null)}
+            >
+              {selectedRoom?.devicePlacement && (
+                <div className="space-y-4">
+                  <label className="block text-sm text-slate-200">
+                    <span className="mb-2 flex items-center justify-between">
+                      <span className="font-semibold">Rotation</span>
+                      <span className="font-mono text-aqua-300">{selectedRoom.devicePlacement.rotationDeg ?? 0} deg</span>
+                    </span>
+                    <input
+                      type="range"
+                      min="0"
+                      max="359"
+                      value={selectedRoom.devicePlacement.rotationDeg ?? 0}
+                      onChange={(e) => {
+                        handleDevicePlacementChange({
+                          ...selectedRoom.devicePlacement!,
+                          rotationDeg: parseInt(e.target.value),
+                        });
+                      }}
+                      onTouchEnd={(e) => {
+                        handleRotationSuggestion(Number((e.currentTarget as HTMLInputElement).value) || 0);
+                      }}
+                      className="w-full"
+                    />
+                  </label>
+                  <label className="flex items-center gap-3 rounded-lg border border-slate-700 bg-slate-800/50 p-3 text-sm text-slate-200">
+                    <input
+                      type="checkbox"
+                      checked={clipRadarToWalls}
+                      onChange={(e) => setClipRadarToWalls(e.target.checked)}
+                      className="h-4 w-4 rounded border-slate-700 bg-slate-800 text-aqua-500"
+                    />
+                    <span className="font-semibold">Clip radar to walls</span>
+                  </label>
+                </div>
+              )}
+            </CanvasMobileSheet>
+
+            <CanvasMobileSheet
+              open={activeMobileCanvasSheet === 'display'}
+              title="Display"
+              onClose={() => setActiveMobileCanvasSheet(null)}
+            >
+              <DisplaySettingsControls
+                overlayOptions={[
+                  { label: 'Device coverage', checked: showDeviceRadar, onChange: setShowDeviceRadar },
+                  { label: 'Clip radar to walls', checked: clipRadarToWalls, onChange: setClipRadarToWalls },
+                ]}
+                roomOptions={[
+                  { label: 'Walls', checked: showWalls, onChange: setShowWalls },
+                  { label: 'Furniture', checked: showFurniture, onChange: setShowFurniture },
+                  { label: 'Doors', checked: showDoors, onChange: setShowDoors },
+                  { label: 'Zones', checked: showZones, onChange: setShowZones },
+                  { label: 'Device icon', checked: showDeviceIcon, onChange: setShowDeviceIcon },
+                  { label: 'Targets', checked: showTargets, onChange: setShowTargets, note: !liveState?.deviceId ? 'No device' : undefined },
+                ]}
+                appearance={{
+                  targetMarkerScale,
+                  setTargetMarkerScale,
+                  showZoneLabels,
+                  setShowZoneLabels,
+                  zoneLabelScale,
+                  setZoneLabelScale,
+                }}
+              />
+            </CanvasMobileSheet>
+
+            <CanvasMobileSheet
+              open={activeMobileCanvasSheet === 'zoom'}
+              title="Zoom & Snap"
+              onClose={() => setActiveMobileCanvasSheet(null)}
+            >
+              <div className="space-y-4">
+                <div className="grid grid-cols-3 gap-2">
+                  <button className="rounded-lg border border-slate-700 bg-slate-800 px-3 py-3 text-sm font-semibold" onClick={() => setCanvasZoom((z) => Math.min(5, z + 0.2))}>Zoom In</button>
+                  <button className="rounded-lg border border-slate-700 bg-slate-800 px-3 py-3 text-sm font-semibold" onClick={() => setCanvasZoom((z) => Math.max(0.1, z - 0.2))}>Zoom Out</button>
+                  <button className="rounded-lg border border-slate-700 bg-slate-800 px-3 py-3 text-sm font-semibold" onClick={resetCanvasView}>Reset</button>
+                </div>
+                {currentStep === 'zones' && (
+                  <button className="w-full rounded-lg border border-aqua-600/50 bg-aqua-600/20 px-3 py-3 text-sm font-semibold text-aqua-100" onClick={handleAutoZoom}>Auto Zoom</button>
+                )}
+                <div>
+                  <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">Snap Grid</div>
+                  <div className="grid grid-cols-4 gap-2">
+                    {[0, 50, 100, 200].map((v) => (
+                      <button
+                        key={v}
+                        onClick={() => setCanvasSnap(v)}
+                        className={`rounded-lg border px-2 py-3 text-sm font-semibold ${
+                          canvasSnap === v
+                            ? 'border-aqua-500 bg-aqua-500/20 text-aqua-100'
+                            : 'border-slate-700 bg-slate-800 text-slate-200'
+                        }`}
+                      >
+                        {formatSnapPresetLabel(v, units)}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </CanvasMobileSheet>
+
+            <CanvasMobileSheet
+              open={activeMobileCanvasSheet === 'zones'}
+              title="Zones"
+              description={polygonModeStatus.enabled ? `${polygonZones.length} polygon zones configured` : `${enabledZones.length} of ${displayZones.length} slots active`}
+              onClose={() => setActiveMobileCanvasSheet(null)}
+            >
+              <div className="space-y-3">
+                {showPolygonPrompt && !polygonModeStatus.enabled && (
+                  <div className="rounded-lg border border-violet-500/50 bg-violet-500/15 p-3">
+                    <div className="mb-2 text-sm font-semibold text-violet-100">Enable Polygon Zones?</div>
+                    <div className="flex gap-2">
+                      <button className="rounded-lg bg-violet-600 px-3 py-2 text-xs font-semibold text-white disabled:opacity-50" onClick={handleEnablePolygonMode} disabled={togglingPolygonMode}>
+                        {togglingPolygonMode ? 'Enabling...' : 'Enable'}
+                      </button>
+                      <button className="rounded-lg border border-slate-600 bg-slate-800 px-3 py-2 text-xs font-semibold text-slate-200" onClick={handleKeepRectangularZones}>
+                        Keep Rectangular
+                      </button>
+                    </div>
+                  </div>
+                )}
+                {polygonModeStatus.enabled ? (
+                  polygonZones.length === 0 ? (
+                    <div className="rounded-lg border border-slate-700 bg-slate-800/50 p-4 text-sm text-slate-400">No polygon zones configured.</div>
+                  ) : (
+                    polygonZones.map((zone) => (
+                      <button
+                        key={zone.id}
+                        type="button"
+                        onClick={() => setSelectedZoneId(zone.id)}
+                        className={`w-full rounded-lg border p-3 text-left text-sm ${
+                          selectedZoneId === zone.id ? 'border-violet-500 bg-violet-500/20 text-white' : 'border-slate-700 bg-slate-800/50 text-slate-200'
+                        }`}
+                      >
+                        <span className="font-bold">{zone.id}</span>
+                        <span className="ml-2 text-xs text-slate-400">{zone.vertices.length} vertices</span>
+                      </button>
+                    ))
+                  )
+                ) : (
+                  displayZones.map((zone) => (
+                    <div key={zone.id} className="rounded-lg border border-slate-700 bg-slate-800/50 p-3">
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <div className="text-sm font-bold text-white">{zone.id}</div>
+                          <div className="text-xs text-slate-400">{zone.type}{zone.enabled ? ' enabled' : ' disabled'}</div>
+                        </div>
+                        <button
+                          onClick={() => {
+                            if (!zone.enabled && zone.type === 'entry' && entryZonesAvailable === false) return;
+                            if (zone.enabled) {
+                              disableZoneSlot(zone.id);
+                            } else {
+                              enableZoneSlot(zone.id);
+                            }
+                          }}
+                          disabled={!zone.enabled && zone.type === 'entry' && entryZonesAvailable === false}
+                          className={`rounded-lg px-3 py-2 text-xs font-semibold ${
+                            zone.enabled
+                              ? 'border border-slate-600 bg-slate-700 text-slate-200'
+                              : 'border border-emerald-600 bg-emerald-600/20 text-emerald-100 disabled:opacity-50'
+                          }`}
+                        >
+                          {zone.enabled ? 'Disable' : 'Enable'}
+                        </button>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </CanvasMobileSheet>
+          </div>
+
           {/* Floating Zone List Panel (zones step only - slides in from right) */}
           {currentStep === 'zones' && showZoneList && (
-            <div className="absolute top-0 right-0 bottom-0 z-50 w-96 border-l border-slate-700 bg-slate-900/95 backdrop-blur shadow-2xl animate-in slide-in-from-right-4 fade-in overflow-y-auto">
+            <div className="absolute top-0 right-0 bottom-0 z-50 hidden w-96 overflow-y-auto border-l border-slate-700 bg-slate-900/95 shadow-2xl backdrop-blur animate-in slide-in-from-right-4 fade-in md:block">
               <div className="sticky top-0 z-10 border-b border-slate-700 bg-slate-900/90 backdrop-blur p-4">
                 <div className="flex items-center justify-between">
                   <h3 className="text-lg font-bold text-white">
@@ -2184,12 +2734,14 @@ export const WizardPage: React.FC<WizardPageProps> = ({
 
           {/* Furniture Editor Panel (furniture step only) */}
           {currentStep === 'furniture' && selectedFurniture && (
-            <FurnitureEditor
-              furniture={selectedFurniture}
-              onChange={handleFurnitureChange}
-              onDelete={() => handleFurnitureDelete(selectedFurniture.id)}
-              onClose={() => setSelectedFurnitureId(null)}
-            />
+            <div className="hidden md:block">
+              <FurnitureEditor
+                furniture={selectedFurniture}
+                onChange={handleFurnitureChange}
+                onDelete={() => handleFurnitureDelete(selectedFurniture.id)}
+                onClose={() => setSelectedFurnitureId(null)}
+              />
+            </div>
           )}
         </div>
       </div>
@@ -2301,9 +2853,14 @@ export const WizardPage: React.FC<WizardPageProps> = ({
       {currentStep === 'device' && (
         <div className={`${slideAnimationClass} rounded-2xl border border-slate-800/50 bg-gradient-to-br from-slate-900/90 to-slate-900/70 p-6 backdrop-blur-xl shadow-xl`}>
           <div className="mb-4">
-            <div className="flex items-center gap-2 mb-2">
+            <div className="mb-2 flex items-start justify-between gap-3">
+              <div className="flex items-center gap-2">
               <span className="text-2xl">📡</span>
               <h3 className="text-lg font-bold text-white">Select your device</h3>
+              </div>
+              <div className="rounded-full border border-slate-700/80 bg-slate-950/70 px-3 py-1 text-[11px] font-semibold uppercase tracking-wide text-slate-300">
+                App v{appVersion}
+              </div>
             </div>
             <p className="text-sm text-slate-400">
               Which Everything Presence device do you want to setup?
@@ -2458,7 +3015,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
 
                   // Calculate offset to center device + FOV together
                   // For 90° rotation (pointing down), shift device up by half the max range
-                  const maxRangeMeters = currentProfile?.limits?.maxRangeMeters ?? 6;
+                  const maxRangeMeters = trackingMaxRangeMeters ?? 6;
                   const maxRangeMm = maxRangeMeters * 1000;
                   const offsetY = -maxRangeMm / 2; // Negative Y shifts upward (device moves up, FOV extends down)
 
@@ -2670,8 +3227,8 @@ export const WizardPage: React.FC<WizardPageProps> = ({
               zoom={canvasZoom}
               panOffsetMm={canvasPan}
               onPanChange={setCanvasPan}
-              onDragStateChange={setIsCanvasDragging}
               displayUnits={units}
+              showWalls={showWalls}
             />
 
             {/* Zoom controls */}
@@ -2712,7 +3269,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
                   }`}
                   onClick={() => setCanvasSnap(v)}
                 >
-                  {v === 0 ? 'Off' : `${v}mm`}
+                  {formatSnapPresetLabel(v, units)}
                 </button>
               ))}
               <span className="ml-auto text-slate-500">Click to add points • Right-drag to pan • Wheel to zoom</span>
@@ -2764,9 +3321,10 @@ export const WizardPage: React.FC<WizardPageProps> = ({
                 }
               }
               onDeviceChange={handleDevicePlacementChange}
-              fieldOfViewDeg={currentProfile?.limits?.fieldOfViewDegrees}
-              maxRangeMeters={currentProfile?.limits?.maxRangeMeters}
-              deviceIconUrl={currentProfile?.iconUrl}
+              fieldOfViewDeg={trackingFieldOfViewDeg}
+              maxRangeMeters={trackingMaxRangeMeters}
+              deviceIconUrl={deviceIconUrl}
+              showRadar={showDeviceRadar}
               clipRadarToWalls={clipRadarToWalls}
               rangeMm={15000}
               snapGridMm={canvasSnap}
@@ -2775,6 +3333,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
               panOffsetMm={canvasPan}
               onPanChange={setCanvasPan}
               displayUnits={units}
+              showWalls={showWalls}
             />
 
             {/* Zoom controls */}
@@ -2815,7 +3374,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
                   }`}
                   onClick={() => setCanvasSnap(v)}
                 >
-                  {v === 0 ? 'Off' : `${v}mm`}
+                  {formatSnapPresetLabel(v, units)}
                 </button>
               ))}
               <div className="flex items-center gap-2 ml-4 pl-4 border-l border-slate-700">
@@ -3088,9 +3647,10 @@ export const WizardPage: React.FC<WizardPageProps> = ({
               roomShell={isRoomMode ? selectedRoom?.roomShell : undefined}
               devicePlacement={isRoomMode ? selectedRoom?.devicePlacement : undefined}
               installationAngle={liveState?.config?.installationAngle}
-              fieldOfViewDeg={currentProfile?.limits?.fieldOfViewDegrees}
-              maxRangeMeters={currentProfile?.limits?.maxRangeMeters}
-              deviceIconUrl={currentProfile?.iconUrl}
+              fieldOfViewDeg={trackingFieldOfViewDeg}
+              maxRangeMeters={trackingMaxRangeMeters}
+              deviceIconUrl={deviceIconUrl}
+              showRadar={showDeviceRadar}
               rangeMm={15000}
               snapGridMm={canvasSnap}
               height="100%"
@@ -3099,6 +3659,13 @@ export const WizardPage: React.FC<WizardPageProps> = ({
               onPanChange={setCanvasPan}
               furniture={selectedRoom?.furniture}
               doors={selectedRoom?.doors}
+              showWalls={showWalls}
+              showFurniture={showFurniture}
+              showDoors={showDoors}
+              showZones={showZones}
+              showDevice={showDeviceIcon}
+              showZoneLabels={showZoneLabels}
+              zoneLabelScale={zoneLabelScale}
             />
 
             {/* Zoom controls */}
@@ -3139,7 +3706,7 @@ export const WizardPage: React.FC<WizardPageProps> = ({
                   }`}
                   onClick={() => setCanvasSnap(v)}
                 >
-                  {v === 0 ? 'Off' : `${v}mm`}
+                  {formatSnapPresetLabel(v, units)}
                 </button>
               ))}
               <span className="ml-auto text-slate-500">Right-drag to pan • Wheel to zoom</span>

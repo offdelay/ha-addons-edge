@@ -9,7 +9,7 @@ import { zoneBackupStorage } from '../config/zoneBackupStorage';
 import { deviceMappingStorage } from '../config/deviceMappingStorage';
 import { deviceEntityService } from '../domain/deviceEntityService';
 import { rectToPolygon, isValidPolygon } from '../domain/polygonUtils';
-import type { ZoneRect, ZonePolygon, EntityMappings } from '../domain/types';
+import type { Zone, ZoneRect, ZonePolygon, EntityMappings } from '../domain/types';
 import type { ZoneBackup } from '../types/zoneBackup';
 import { logger } from '../logger';
 
@@ -49,8 +49,17 @@ const parseZoneIndex = (id: string): number => {
 const sortZonesByIndex = (zones: ZoneRect[]): ZoneRect[] =>
   [...zones].sort((a, b) => parseZoneIndex(a.id) - parseZoneIndex(b.id));
 
+const sortPolygonZonesByIndex = (zones: ZonePolygon[]): ZonePolygon[] =>
+  [...zones].sort((a, b) => parseZoneIndex(a.id) - parseZoneIndex(b.id));
+
 const isValidRect = (zone: ZoneRect): boolean =>
   Number.isFinite(zone.width) && Number.isFinite(zone.height) && zone.width > 0 && zone.height > 0;
+
+const isZoneRect = (zone: Zone): zone is ZoneRect =>
+  typeof zone === 'object' && zone !== null && 'width' in zone && 'height' in zone;
+
+const isZonePolygon = (zone: Zone): zone is ZonePolygon =>
+  typeof zone === 'object' && zone !== null && 'vertices' in zone;
 
 export const createZoneBackupsRouter = (deps: ZoneBackupsRouterDependencies): Router => {
   const router = Router();
@@ -97,13 +106,12 @@ export const createZoneBackupsRouter = (deps: ZoneBackupsRouterDependencies): Ro
 
   /**
    * POST /api/zone-backups
-   * Create a backup from device rectangular zones.
+   * Create a backup from device zones.
    * Body: { deviceId, profileId, entityNamePrefix?, entityMappings? }
    */
   router.post('/', async (req, res) => {
     const deviceId = req.body?.deviceId as string | undefined;
     const profileId = req.body?.profileId as string | undefined;
-    const entityNamePrefix = req.body?.entityNamePrefix as string | undefined;
     const entityMappings = parseEntityMappings(req.body?.entityMappings);
 
     if (!deviceId) {
@@ -118,16 +126,16 @@ export const createZoneBackupsRouter = (deps: ZoneBackupsRouterDependencies): Ro
       return res.status(404).json({ message: 'Profile not found' });
     }
 
-    const prefix =
-      entityNamePrefix ||
-      deviceEntityService.getDeviceNamePrefix(deviceId) ||
-      undefined;
-    if (!prefix) {
-      return res.status(400).json({ message: 'entityNamePrefix is required when device mapping is missing' });
+    const hasDeviceMapping = deviceMappingStorage.hasMapping(deviceId);
+    if (!hasDeviceMapping && !entityMappings) {
+      return res.status(409).json({ message: 'Device mapping not found. Run entity re-sync to create mappings.', code: 'MAPPING_NOT_FOUND' });
     }
 
     try {
-      const zones = await zoneReader.readZones(profile.entityMap as any, prefix, entityMappings, deviceId);
+      const polygonZones = await zoneReader.readPolygonZones(profile.entityMap as any, undefined, entityMappings, deviceId);
+      const zones = polygonZones.length > 0
+        ? polygonZones
+        : await zoneReader.readZones(profile.entityMap as any, undefined, entityMappings, deviceId);
       const mapping = deviceMappingStorage.getMapping(deviceId);
       const backup: ZoneBackup = {
         id: generateId(),
@@ -141,7 +149,8 @@ export const createZoneBackupsRouter = (deps: ZoneBackupsRouterDependencies): Ro
         zones,
         zoneLabels: mapping?.zoneLabels ?? undefined,
         metadata: {
-          entityNamePrefix: prefix,
+          entityNamePrefix: deviceEntityService.getDeviceNamePrefix(deviceId) ?? undefined,
+          notes: polygonZones.length > 0 ? 'polygon' : 'rectangular',
         },
       };
 
@@ -169,7 +178,7 @@ export const createZoneBackupsRouter = (deps: ZoneBackupsRouterDependencies): Ro
       }
       const deviceId = typeof entry.deviceId === 'string' ? entry.deviceId : undefined;
       const profileId = typeof entry.profileId === 'string' ? entry.profileId : undefined;
-      const zones = Array.isArray(entry.zones) ? (entry.zones as ZoneRect[]) : undefined;
+      const zones = Array.isArray(entry.zones) ? (entry.zones as Zone[]) : undefined;
       if (!deviceId || !profileId || !zones) {
         continue;
       }
@@ -200,7 +209,7 @@ export const createZoneBackupsRouter = (deps: ZoneBackupsRouterDependencies): Ro
 
   /**
    * POST /api/zone-backups/:backupId/restore
-   * Restore a backup by converting rectangular zones to polygons.
+   * Restore a backup by applying polygon zones directly or converting rectangular zones.
    * Body: { deviceId?, profileId?, entityNamePrefix?, entityMappings? }
    */
   router.post('/:backupId/restore', async (req, res) => {
@@ -212,7 +221,6 @@ export const createZoneBackupsRouter = (deps: ZoneBackupsRouterDependencies): Ro
 
     const deviceId = (req.body?.deviceId as string | undefined) ?? backup.deviceId;
     const profileId = (req.body?.profileId as string | undefined) ?? backup.profileId;
-    const entityNamePrefix = req.body?.entityNamePrefix as string | undefined;
     const entityMappings = parseEntityMappings(req.body?.entityMappings);
 
     if (!deviceId) {
@@ -232,12 +240,9 @@ export const createZoneBackupsRouter = (deps: ZoneBackupsRouterDependencies): Ro
       return res.status(409).json({ message: 'Polygon zones are not supported for this device profile' });
     }
 
-    const prefix =
-      entityNamePrefix ||
-      deviceEntityService.getDeviceNamePrefix(deviceId) ||
-      undefined;
-    if (!prefix) {
-      return res.status(400).json({ message: 'entityNamePrefix is required when device mapping is missing' });
+    const hasDeviceMapping = deviceMappingStorage.hasMapping(deviceId);
+    if (!hasDeviceMapping && !entityMappings) {
+      return res.status(409).json({ message: 'Device mapping not found. Run entity re-sync to create mappings.', code: 'MAPPING_NOT_FOUND' });
     }
 
     const limits = profile.limits ?? {};
@@ -245,14 +250,24 @@ export const createZoneBackupsRouter = (deps: ZoneBackupsRouterDependencies): Ro
     const maxExclusion = limits.maxExclusionZones ?? 2;
     const maxEntry = limits.maxEntryZones ?? 2;
 
-    const regularZones = sortZonesByIndex(
-      backup.zones.filter((zone) => zone.type === 'regular' && isValidRect(zone))
+    const regularPolygonZones = sortPolygonZonesByIndex(
+      backup.zones.filter((zone): zone is ZonePolygon => zone.type === 'regular' && isZonePolygon(zone) && isValidPolygon(zone.vertices))
     ).slice(0, maxZones);
-    const exclusionZones = sortZonesByIndex(
-      backup.zones.filter((zone) => zone.type === 'exclusion' && isValidRect(zone))
+    const exclusionPolygonZones = sortPolygonZonesByIndex(
+      backup.zones.filter((zone): zone is ZonePolygon => zone.type === 'exclusion' && isZonePolygon(zone) && isValidPolygon(zone.vertices))
     ).slice(0, maxExclusion);
-    const entryZones = sortZonesByIndex(
-      backup.zones.filter((zone) => zone.type === 'entry' && isValidRect(zone))
+    const entryPolygonZones = sortPolygonZonesByIndex(
+      backup.zones.filter((zone): zone is ZonePolygon => zone.type === 'entry' && isZonePolygon(zone) && isValidPolygon(zone.vertices))
+    ).slice(0, maxEntry);
+
+    const regularRectZones = sortZonesByIndex(
+      backup.zones.filter((zone): zone is ZoneRect => zone.type === 'regular' && isZoneRect(zone) && isValidRect(zone))
+    ).slice(0, maxZones);
+    const exclusionRectZones = sortZonesByIndex(
+      backup.zones.filter((zone): zone is ZoneRect => zone.type === 'exclusion' && isZoneRect(zone) && isValidRect(zone))
+    ).slice(0, maxExclusion);
+    const entryRectZones = sortZonesByIndex(
+      backup.zones.filter((zone): zone is ZoneRect => zone.type === 'entry' && isZoneRect(zone) && isValidRect(zone))
     ).slice(0, maxEntry);
 
     // Restore writes zones sequentially into slot 1..N regardless of original slot index.
@@ -263,26 +278,41 @@ export const createZoneBackupsRouter = (deps: ZoneBackupsRouterDependencies): Ro
     const entryIdMap = new Map<string, string>();
 
     const polygons: ZonePolygon[] = [
-      ...regularZones.map((zone, idx) => {
+      ...regularPolygonZones.map((zone, idx) => {
         const newId = `Zone ${idx + 1}`;
+        regularIdMap.set(zone.id, newId);
+        return { ...zone, id: newId };
+      }),
+      ...exclusionPolygonZones.map((zone, idx) => {
+        const newId = `Exclusion ${idx + 1}`;
+        exclusionIdMap.set(zone.id, newId);
+        return { ...zone, id: newId };
+      }),
+      ...entryPolygonZones.map((zone, idx) => {
+        const newId = `Entry ${idx + 1}`;
+        entryIdMap.set(zone.id, newId);
+        return { ...zone, id: newId };
+      }),
+      ...regularRectZones.map((zone, idx) => {
+        const newId = `Zone ${regularPolygonZones.length + idx + 1}`;
         regularIdMap.set(zone.id, newId);
         return { ...rectToPolygon(zone), id: newId };
       }),
-      ...exclusionZones.map((zone, idx) => {
-        const newId = `Exclusion ${idx + 1}`;
+      ...exclusionRectZones.map((zone, idx) => {
+        const newId = `Exclusion ${exclusionPolygonZones.length + idx + 1}`;
         exclusionIdMap.set(zone.id, newId);
         return { ...rectToPolygon(zone), id: newId };
       }),
-      ...entryZones.map((zone, idx) => {
-        const newId = `Entry ${idx + 1}`;
+      ...entryRectZones.map((zone, idx) => {
+        const newId = `Entry ${entryPolygonZones.length + idx + 1}`;
         entryIdMap.set(zone.id, newId);
         return { ...rectToPolygon(zone), id: newId };
       }),
     ].filter((zone) => isValidPolygon(zone.vertices));
 
     try {
-      await zoneWriter.setPolygonMode(profile.entityMap as any, prefix, true, entityMappings, deviceId);
-      const result = await zoneWriter.applyPolygonZones(profile.entityMap as any, polygons, prefix, entityMappings, deviceId);
+      await zoneWriter.setPolygonMode(profile.entityMap as any, undefined, true, entityMappings, deviceId);
+      const result = await zoneWriter.applyPolygonZones(profile.entityMap as any, polygons, undefined, entityMappings, deviceId);
 
       const warnings = [...result.failures];
       if (backup.zoneLabels) {
@@ -315,9 +345,9 @@ export const createZoneBackupsRouter = (deps: ZoneBackupsRouterDependencies): Ro
         warnings,
         backupId,
         applied: {
-          regular: regularZones.length,
-          exclusion: exclusionZones.length,
-          entry: entryZones.length,
+          regular: regularPolygonZones.length + regularRectZones.length,
+          exclusion: exclusionPolygonZones.length + exclusionRectZones.length,
+          entry: entryPolygonZones.length + entryRectZones.length,
         },
       });
     } catch (error) {

@@ -1,5 +1,5 @@
 name: Everything Presence Zone Configurator
-version: 2.0.12
+version: 2.2.4
 slug: everything-presence-zone-configurator
 description: Helps you to visualise Everything Presence Lite, Everything Presence One and Everything Presence Pro, a mmWave Presence Sensor for Home Assistant with real-time tracking (Everything Presence Lite) and other advanced capabilities.
 url: https://github.com/everythingsmarthome/everything-presence-addons
@@ -12,14 +12,14 @@ boot: auto
 ingress: true
 ingress_port: 42069
 panel_icon: mdi:radar
-panel_title: Zone Configurator
+panel_title: Presence
 watchdog: "http://[HOST]:[PORT:42069]/api/health"
 ports:
   42069/tcp: null
   38080/tcp: 38080
 ports_description:
-  42069/tcp: Optional direct access (ingress preferred, configurable in add-on settings)
-  38080/tcp: LAN firmware server for device OTA updates (configurable in add-on settings)
+  42069/tcp: Optional direct access (ingress preferred, configurable in app settings)
+  38080/tcp: LAN firmware server for device OTA updates (configurable in app settings)
 homeassistant_api: true
 auth_api: true
 hassio_api: true

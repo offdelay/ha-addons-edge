@@ -1,12 +1,19 @@
-import type { IHaReadTransport } from '../ha/readTransport';
+﻿import type { IHaReadTransport } from '../ha/readTransport';
 import type { EntityRegistryEntry } from '../ha/types';
 import type { DeviceRegistryEntry } from '../ha/readTransport';
-import type { DeviceProfileLoader } from './deviceProfiles';
+import type { DeviceProfile, DeviceProfileLoader } from './deviceProfiles';
 import type { EntityMappings, ZoneEntitySet, TargetEntitySet } from './types';
 import { deviceMappingStorage, DeviceMapping, parseFirmwareVersion } from '../config/deviceMappingStorage';
 import { logger } from '../logger';
 import { telemetry } from '../logger/telemetry';
 import { normalizeMappingKeys } from './mappingUtils';
+import { isPolygonOnlyDevice } from './firmwareVersionUtils';
+import {
+  deriveEntityPrefixFromRegistryEntries,
+  extractEsphomeNodeName,
+  filterEverythingPresenceDevices,
+  isEverythingPresenceManufacturer,
+} from './everythingPresenceDevices';
 
 /**
  * Entity definition from profile.entities with template for discovery.
@@ -79,9 +86,70 @@ export class EntityDiscoveryService {
   /**
    * Get all entities belonging to a specific device.
    */
-  async getDeviceEntities(deviceId: string): Promise<EntityRegistryEntry[]> {
-    const entityRegistry = await this.readTransport.listEntityRegistry();
-    return entityRegistry.filter((e) => e.device_id === deviceId);
+  async getDeviceEntities(deviceId: string, profileId?: string): Promise<EntityRegistryEntry[]> {
+    const device = await this.getEverythingPresenceDevice(deviceId);
+    if (!device) {
+      logger.warn({ deviceId }, 'Refusing entity discovery for non-Everything Presence device');
+      return [];
+    }
+
+    try {
+      const entityRegistry = await this.readTransport.listEntityRegistry();
+      const registryEntities = entityRegistry.filter((entry) => entry.device_id === deviceId);
+      if (registryEntities.length > 0) {
+        logger.info(
+          { deviceId, entityCount: registryEntities.length },
+          'Loaded device entities from Home Assistant entity registry'
+        );
+        return registryEntities;
+      }
+
+      logger.warn(
+        { deviceId, profileId },
+        'No entity-registry entries linked to device; falling back to prefix-based discovery'
+      );
+    } catch (err) {
+      logger.warn(
+        { err, deviceId, profileId },
+        'Failed to read entity registry for device; falling back to prefix-based discovery'
+      );
+    }
+
+    return this.getDeviceEntitiesByPrefixFallback(device, deviceId, profileId);
+  }
+
+  private async getDeviceEntitiesByPrefixFallback(
+    device: DeviceRegistryEntry,
+    deviceId: string,
+    profileId?: string
+  ): Promise<EntityRegistryEntry[]> {
+    const profiles = this.getCandidateProfiles(profileId);
+    const prefixes = await this.getCandidateNamePrefixes(device);
+    const candidateEntityIds = this.buildCandidateEntityIds(prefixes, profiles);
+
+    if (candidateEntityIds.size === 0) {
+      logger.warn({ deviceId, profileId }, 'No candidate entity IDs generated for device discovery fallback');
+      return [];
+    }
+
+    const allStates = await this.readTransport.getAllStates();
+    const matchedEntities = allStates
+      .filter((state) => candidateEntityIds.has(state.entity_id))
+      .map((state) => ({
+        entity_id: state.entity_id,
+        name: typeof state.attributes.friendly_name === 'string' ? state.attributes.friendly_name : null,
+        platform: '',
+        device_id: deviceId,
+        disabled_by: null,
+        hidden_by: null,
+      }));
+
+    logger.info(
+      { deviceId, candidateCount: candidateEntityIds.size, matchedCount: matchedEntities.length },
+      'Resolved targeted Everything Presence entity candidates via fallback discovery'
+    );
+
+    return matchedEntities;
   }
 
   /**
@@ -97,8 +165,30 @@ export class EntityDiscoveryService {
     }
 
     // Get all entities for this device
-    const deviceEntities = await this.getDeviceEntities(deviceId);
+    const deviceEntities = await this.getDeviceEntities(deviceId, profileId);
     logger.info({ deviceId, entityCount: deviceEntities.length }, 'Found device entities');
+
+    // Fetch device info early so discovery can be version-aware for breaking changes.
+    let rawSwVersion: string | undefined;
+    let firmwareVersion: string | undefined;
+    let esphomeVersion: string | undefined;
+    let esphomeNodeName: string | undefined;
+    try {
+      const devices = await this.readTransport.listDevices();
+      const device = devices.find(d => d.id === deviceId);
+      if (device?.sw_version) {
+        rawSwVersion = device.sw_version;
+        const parsed = parseFirmwareVersion(device.sw_version);
+        firmwareVersion = parsed.firmwareVersion;
+        esphomeVersion = parsed.esphomeVersion;
+        logger.debug({ deviceId, rawSwVersion, firmwareVersion, esphomeVersion }, 'Parsed firmware version');
+      }
+      if (device) {
+        esphomeNodeName = this.extractEsphomeNodeName(device);
+      }
+    } catch (err) {
+      logger.warn({ err, deviceId }, 'Failed to fetch device firmware version, continuing without it');
+    }
 
     // Attempt ESPHome service discovery in parallel with entity discovery.
     // This mirrors the entity auto-match flow: try to find services now,
@@ -106,18 +196,7 @@ export class EntityDiscoveryService {
     let serviceMappings: Record<string, string> | undefined;
     try {
       const existingMapping = deviceMappingStorage.getMapping(deviceId);
-      let esphomeNodeName = existingMapping?.esphomeNodeName;
-      if (!esphomeNodeName) {
-        try {
-          const devices = await this.readTransport.listDevices();
-          const device = devices.find(d => d.id === deviceId);
-          if (device) {
-            esphomeNodeName = this.extractEsphomeNodeName(device);
-          }
-        } catch (err) {
-          logger.warn({ err, deviceId }, 'Failed to fetch device info for service discovery, continuing without it');
-        }
-      }
+      esphomeNodeName = esphomeNodeName ?? existingMapping?.esphomeNodeName;
 
       const discoveredBuildFlags = await this.discoverServiceBySuffix(
         deviceId,
@@ -167,8 +246,17 @@ export class EntityDiscoveryService {
 
     // Check for new entities metadata format
     const profileEntities = (profile as unknown as Record<string, unknown>).entities as Record<string, EntityDefinitionWithTemplate> | undefined;
-    const entityMap = (profile as unknown as Record<string, unknown>).entityMap as Record<string, unknown>;
+    const rawEntityMap = (profile as unknown as Record<string, unknown>).entityMap as Record<string, unknown>;
     const capabilities = profile.capabilities as Record<string, unknown>;
+    const polygonOnlyEpl = isPolygonOnlyDevice({
+      profileId,
+      firmwareVersion,
+      model: (profile as unknown as Record<string, unknown>).model as string | undefined,
+    });
+    const profileEntitiesForDiscovery = profileEntities
+      ? this.filterProfileEntitiesForFirmware(profileEntities, polygonOnlyEpl)
+      : undefined;
+    const entityMap = this.filterLegacyEntityMapForFirmware(rawEntityMap, polygonOnlyEpl);
 
     // Match all entities
     const results: EntityMatchResult[] = [];
@@ -179,10 +267,10 @@ export class EntityDiscoveryService {
     };
 
     // Use profile.entities metadata when available (preferred)
-    if (profileEntities) {
+    if (profileEntitiesForDiscovery) {
       logger.info({ deviceId, profileId }, 'Using profile.entities metadata for discovery');
       this.discoverUsingEntitiesMetadata(
-        profileEntities,
+        profileEntitiesForDiscovery,
         deviceEntities,
         entitiesByDomain,
         results,
@@ -266,6 +354,95 @@ export class EntityDiscoveryService {
     }
 
     return byDomain;
+  }
+
+  private async getEverythingPresenceDevice(deviceId: string): Promise<DeviceRegistryEntry | null> {
+    const devices = await this.readTransport.listDevices();
+    return filterEverythingPresenceDevices(devices).find((device) => device.id === deviceId) ?? null;
+  }
+
+  private getCandidateProfiles(profileId?: string): DeviceProfile[] {
+    if (profileId) {
+      const profile = this.profileLoader.getProfileById(profileId);
+      return profile ? [profile] : [];
+    }
+
+    return this.profileLoader
+      .listProfiles()
+      .filter((profile) => isEverythingPresenceManufacturer(profile.manufacturer));
+  }
+
+  private async getCandidateNamePrefixes(device: DeviceRegistryEntry): Promise<string[]> {
+    const prefixes = new Set<string>();
+    const esphomeNodeName = extractEsphomeNodeName(device);
+    if (esphomeNodeName) {
+      prefixes.add(esphomeNodeName);
+    }
+
+    if (prefixes.size === 0) {
+      try {
+        const entityRegistry = await this.readTransport.listEntityRegistry();
+        const deviceEntities = entityRegistry.filter((entry) => entry.device_id === device.id);
+        const registryPrefix = deriveEntityPrefixFromRegistryEntries(deviceEntities);
+        if (registryPrefix) {
+          prefixes.add(registryPrefix);
+        }
+      } catch (err) {
+        logger.warn({ err, deviceId: device.id }, 'Failed to derive entity prefix from registry fallback');
+      }
+    }
+
+    return Array.from(prefixes);
+  }
+
+  private buildCandidateEntityIds(prefixes: string[], profiles: DeviceProfile[]): Set<string> {
+    const candidateEntityIds = new Set<string>();
+
+    for (const prefix of prefixes) {
+      for (const profile of profiles) {
+        const profileEntities = profile.entities as Record<string, EntityDefinitionWithTemplate> | undefined;
+        if (profileEntities) {
+          for (const definition of Object.values(profileEntities)) {
+            if (typeof definition.template === 'string') {
+              candidateEntityIds.add(definition.template.replace('${name}', prefix));
+            }
+          }
+        }
+
+        const entityMap = profile.entityMap as Record<string, unknown> | undefined;
+        if (entityMap) {
+          this.collectTemplatesFromLegacyMap(entityMap, candidateEntityIds, prefix);
+        }
+      }
+    }
+
+    return candidateEntityIds;
+  }
+
+  private collectTemplatesFromLegacyMap(
+    value: unknown,
+    candidateEntityIds: Set<string>,
+    prefix: string
+  ): void {
+    if (typeof value === 'string') {
+      if (value.includes('${name}')) {
+        candidateEntityIds.add(value.replace('${name}', prefix));
+      }
+      return;
+    }
+
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        this.collectTemplatesFromLegacyMap(item, candidateEntityIds, prefix);
+      }
+      return;
+    }
+
+    if (value && typeof value === 'object') {
+      for (const nested of Object.values(value as Record<string, unknown>)) {
+        this.collectTemplatesFromLegacyMap(nested, candidateEntityIds, prefix);
+      }
+    }
   }
 
   /**
@@ -602,6 +779,10 @@ export class EntityDiscoveryService {
     const category = def.category;
 
     if (category === 'sensor') {
+      if (def.subcategory === 'zoneOccupancy' || def.subcategory === 'zoneTargetCount') {
+        (suggestedMappings as Record<string, unknown>)[entityKey] = entityId;
+        return;
+      }
       // Core sensors go at the root with Entity suffix for legacy compatibility
       const legacyKey = entityKey.endsWith('Entity') ? entityKey : `${entityKey}Entity`;
       (suggestedMappings as Record<string, unknown>)[legacyKey] = entityId;
@@ -689,6 +870,43 @@ export class EntityDiscoveryService {
       trackingTargets[targetKey] = {} as TargetEntitySet;
     }
     (trackingTargets[targetKey] as unknown as Record<string, string>)[property] = entityId;
+  }
+
+  private filterProfileEntitiesForFirmware(
+    profileEntities: Record<string, EntityDefinitionWithTemplate>,
+    polygonOnlyEpl: boolean
+  ): Record<string, EntityDefinitionWithTemplate> {
+    if (!polygonOnlyEpl) {
+      return profileEntities;
+    }
+
+    return Object.fromEntries(
+      Object.entries(profileEntities).filter(([entityKey, def]) => {
+        if (entityKey === 'polygonZonesEnabled') {
+          return false;
+        }
+        if (def.category !== 'zone') {
+          return true;
+        }
+        return !['regular', 'exclusion', 'entry'].includes(def.zoneType ?? '');
+      })
+    );
+  }
+
+  private filterLegacyEntityMapForFirmware(
+    entityMap: Record<string, unknown>,
+    polygonOnlyEpl: boolean
+  ): Record<string, unknown> {
+    if (!polygonOnlyEpl) {
+      return entityMap;
+    }
+
+    const filtered = { ...entityMap };
+    delete filtered.polygonZonesEnabledEntity;
+    delete filtered.zoneConfigEntities;
+    delete filtered.exclusionZoneConfigEntities;
+    delete filtered.entryZoneConfigEntities;
+    return filtered;
   }
 
   /**
@@ -830,6 +1048,11 @@ export class EntityDiscoveryService {
     deviceId?: string
   ): Promise<{ valid: boolean; errors: Array<{ key: string; entityId: string; error: string }> }> {
     const errors: Array<{ key: string; entityId: string; error: string }> = [];
+    const existingMapping = deviceId ? deviceMappingStorage.getMapping(deviceId) : null;
+    const skipLegacyRectangles = isPolygonOnlyDevice({
+      profileId: existingMapping?.profileId,
+      firmwareVersion: existingMapping?.firmwareVersion,
+    });
 
     let registryById: Map<string, EntityRegistryEntry> = new Map();
     try {
@@ -874,9 +1097,9 @@ export class EntityDiscoveryService {
       'presenceEntity', 'mmwaveEntity', 'pirEntity', 'temperatureEntity',
       'humidityEntity', 'illuminanceEntity', 'co2Entity', 'distanceEntity',
       'speedEntity', 'energyEntity', 'targetCountEntity', 'modeEntity',
-      'maxDistanceEntity', 'installationAngleEntity', 'polygonZonesEnabledEntity',
+      'maxDistanceEntity', 'installationAngleEntity', 'upsideDownMountingEntity', 'polygonZonesEnabledEntity',
       'trackingTargetCountEntity', 'firmwareUpdateEntity', 'assumedPresentEntity', 'assumedPresentRemainingEntity',
-    ];
+    ].filter((key) => !(skipLegacyRectangles && key === 'polygonZonesEnabledEntity'));
 
     for (const key of flatKeys) {
       const entityId = (mappings as Record<string, unknown>)[key];
@@ -886,7 +1109,9 @@ export class EntityDiscoveryService {
     }
 
     // Check zone entities
-    const zoneGroups = ['zoneConfigEntities', 'exclusionZoneConfigEntities', 'entryZoneConfigEntities'];
+    const zoneGroups = skipLegacyRectangles
+      ? []
+      : ['zoneConfigEntities', 'exclusionZoneConfigEntities', 'entryZoneConfigEntities'];
     for (const groupKey of zoneGroups) {
       const group = (mappings as Record<string, unknown>)[groupKey];
       if (group && typeof group === 'object') {
@@ -962,7 +1187,7 @@ export class EntityDiscoveryService {
     // Fetch unit_of_measurement for tracking entities (x/y coordinates)
     const entityUnits = await this.fetchEntityUnits(flatMappings);
 
-    // Fetch device info to get firmware version
+    // Fetch device info for firmware metadata and ESPHome node name.
     let rawSwVersion: string | undefined;
     let firmwareVersion: string | undefined;
     let esphomeVersion: string | undefined;
@@ -975,7 +1200,6 @@ export class EntityDiscoveryService {
         const parsed = parseFirmwareVersion(device.sw_version);
         firmwareVersion = parsed.firmwareVersion;
         esphomeVersion = parsed.esphomeVersion;
-      logger.debug({ deviceId, rawSwVersion, firmwareVersion, esphomeVersion }, 'Parsed firmware version');
       }
       if (device) {
         esphomeNodeName = this.extractEsphomeNodeName(device);
@@ -1135,21 +1359,7 @@ export class EntityDiscoveryService {
   }
 
   private extractEsphomeNodeName(device: DeviceRegistryEntry): string | undefined {
-    for (const [domain, identifier] of device.identifiers ?? []) {
-      if (typeof domain === 'string' && typeof identifier === 'string' && domain.toLowerCase() === 'esphome') {
-        return identifier;
-      }
-    }
-    return this.slugifyDeviceName(device.name);
-  }
-
-  private slugifyDeviceName(name: string | null | undefined): string | undefined {
-    if (!name) return undefined;
-    const slug = name
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '_')
-      .replace(/^_+|_+$/g, '');
-    return slug || undefined;
+    return extractEsphomeNodeName(device);
   }
 
   /**
@@ -1180,6 +1390,7 @@ export class EntityDiscoveryService {
     // Configuration entities
     if (em.maxDistanceEntity) mappings['maxDistance'] = em.maxDistanceEntity;
     if (em.installationAngleEntity) mappings['installationAngle'] = em.installationAngleEntity;
+    if (em.upsideDownMountingEntity) mappings['upsideDownMounting'] = em.upsideDownMountingEntity;
     if (em.polygonZonesEnabledEntity) mappings['polygonZonesEnabled'] = em.polygonZonesEnabledEntity;
     if (em.trackingTargetCountEntity) mappings['trackingTargetCount'] = em.trackingTargetCountEntity;
     if (em.firmwareUpdateEntity) mappings['firmwareUpdate'] = em.firmwareUpdateEntity;

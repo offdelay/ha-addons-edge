@@ -8,7 +8,8 @@ import { ZoneReader } from '../ha/zoneReader';
 import { RoomConfig, ZonePolygon, EntityMappings } from '../domain/types';
 import { EntityResolver } from '../domain/entityResolver';
 import { deviceEntityService } from '../domain/deviceEntityService';
-import { deviceMappingStorage } from '../config/deviceMappingStorage';
+import { deviceMappingStorage, parseFirmwareVersion } from '../config/deviceMappingStorage';
+import { isPolygonOnlyDevice } from '../domain/firmwareVersionUtils';
 import { logger } from '../logger';
 
 export interface DevicesRouterDependencies {
@@ -34,6 +35,37 @@ export const createDevicesRouter = (deps: DevicesRouterDependencies): Router => 
     const normalized = normalizeStateValue(state);
     // Treat "unknown" as available for readiness purposes; it's common immediately after reboot.
     return normalized === 'unavailable';
+  };
+  const parseEntityMappings = (value: unknown, logContext: string): EntityMappings | undefined => {
+    if (!value || typeof value !== 'string') {
+      return undefined;
+    }
+
+    try {
+      return JSON.parse(value) as EntityMappings;
+    } catch {
+      logger.warn({ logContext }, 'Invalid entityMappings JSON');
+      return undefined;
+    }
+  };
+  const hasRuntimeMappings = (deviceId: string, entityMappings?: EntityMappings): boolean =>
+    deviceMappingStorage.hasMapping(deviceId) || !!entityMappings;
+  const getDeviceFirmwareVersion = async (deviceId: string): Promise<string | undefined> => {
+
+    try {
+      const devices = await readTransport.listDevices();
+      const device = devices.find((candidate) => candidate.id === deviceId);
+      if (device?.sw_version) {
+        const parsed = parseFirmwareVersion(device.sw_version).firmwareVersion;
+        if (parsed) {
+          return parsed;
+        }
+      }
+    } catch (error) {
+      logger.warn({ error, deviceId }, 'Failed to fetch firmware version for device route');
+    }
+
+    return deviceMappingStorage.getMapping(deviceId)?.firmwareVersion;
   };
 
   router.get('/', async (_req, res) => {
@@ -352,10 +384,9 @@ export const createDevicesRouter = (deps: DevicesRouterDependencies): Router => 
 
   router.get('/:deviceId/zone-availability', async (req, res) => {
     const { deviceId } = req.params;
-    const { profileId, entityNamePrefix, entityMappings: entityMappingsJson } = req.query;
-
-    if (!profileId || !entityNamePrefix) {
-      return res.status(400).json({ message: 'profileId and entityNamePrefix are required' });
+    const { profileId, entityMappings: entityMappingsJson } = req.query;
+    if (!profileId) {
+      return res.status(400).json({ message: 'profileId is required' });
     }
 
     const profile = profileLoader.getProfileById(profileId as string);
@@ -369,21 +400,25 @@ export const createDevicesRouter = (deps: DevicesRouterDependencies): Router => 
     }
 
     // Parse entityMappings if provided (JSON string in query param)
-    let entityMappings: EntityMappings | undefined;
-    if (entityMappingsJson && typeof entityMappingsJson === 'string') {
-      try {
-        entityMappings = JSON.parse(entityMappingsJson);
-      } catch {
-        logger.warn('Invalid entityMappings JSON in zone-availability query');
-      }
+    const entityMappings = parseEntityMappings(entityMappingsJson, 'zone-availability');
+    if (!hasRuntimeMappings(deviceId, entityMappings)) {
+      return res.status(409).json({
+        message: 'Device mapping not found. Run entity re-sync to create mappings.',
+        code: 'MAPPING_NOT_FOUND',
+      });
     }
 
     // Check if device has device-level mappings (preferred)
     const hasDeviceMapping = deviceMappingStorage.hasMapping(deviceId);
+    const firmwareVersion = await getDeviceFirmwareVersion(deviceId);
+    const polygonOnlyEpl = isPolygonOnlyDevice({
+      profileId: profile.id,
+      firmwareVersion,
+      model: (profile as unknown as { model?: string }).model,
+    });
 
     try {
       const entityRegistry = await readTransport.listEntityRegistry();
-      const prefix = entityNamePrefix as string;
 
       const availability: Record<string, { enabled: boolean; disabledBy: string | null; status: 'enabled' | 'disabled' | 'unavailable' | 'unknown' }> = {};
       const polygonAvailability: Record<string, { enabled: boolean; disabledBy: string | null; status: 'enabled' | 'disabled' | 'unavailable' | 'unknown' }> = {};
@@ -391,13 +426,13 @@ export const createDevicesRouter = (deps: DevicesRouterDependencies): Router => 
       const zoneEntitiesByKey = new Map<string, string[]>();
       const polygonEntitiesByKey = new Map<string, string[]>();
 
-      // Helper to resolve zone entity set - tries device mapping first, then legacy
+      // Helper to resolve zone entity set - tries device mapping first, then room-stored mappings.
       const resolveZoneSet = (type: 'regular' | 'exclusion' | 'entry', index: number, groupKey: 'zoneConfigEntities' | 'exclusionZoneConfigEntities' | 'entryZoneConfigEntities', key: string, mapping?: Record<string, string>) => {
         if (hasDeviceMapping) {
           const zoneSet = deviceEntityService.getZoneEntitySet(deviceId, type, index);
           if (zoneSet) return zoneSet;
         }
-        return EntityResolver.resolveZoneEntitySet(entityMappings, prefix, groupKey, key, mapping);
+        return EntityResolver.resolveZoneEntitySet(entityMappings, undefined, groupKey, key, mapping);
       };
 
       // Helper to extract zone index from key like "zone1" or "entry2"
@@ -407,7 +442,7 @@ export const createDevicesRouter = (deps: DevicesRouterDependencies): Router => 
       };
 
       // Check regular zones
-      if (zoneMap.zoneConfigEntities || hasDeviceMapping) {
+      if (!polygonOnlyEpl && (zoneMap.zoneConfigEntities || hasDeviceMapping)) {
         const zoneKeys = Object.keys(zoneMap.zoneConfigEntities || {});
         for (const zoneKey of zoneKeys) {
           const zoneEntities = (zoneMap.zoneConfigEntities?.[zoneKey] || {}) as Record<string, string>;
@@ -420,7 +455,7 @@ export const createDevicesRouter = (deps: DevicesRouterDependencies): Router => 
       }
 
       // Check exclusion zones
-      if (zoneMap.exclusionZoneConfigEntities || hasDeviceMapping) {
+      if (!polygonOnlyEpl && (zoneMap.exclusionZoneConfigEntities || hasDeviceMapping)) {
         const zoneKeys = Object.keys(zoneMap.exclusionZoneConfigEntities || {});
         for (const zoneKey of zoneKeys) {
           const zoneEntities = (zoneMap.exclusionZoneConfigEntities?.[zoneKey] || {}) as Record<string, string>;
@@ -433,7 +468,7 @@ export const createDevicesRouter = (deps: DevicesRouterDependencies): Router => 
       }
 
       // Check entry zones
-      if (zoneMap.entryZoneConfigEntities || hasDeviceMapping) {
+      if (!polygonOnlyEpl && (zoneMap.entryZoneConfigEntities || hasDeviceMapping)) {
         const zoneKeys = Object.keys(zoneMap.entryZoneConfigEntities || {});
         for (const zoneKey of zoneKeys) {
           const zoneEntities = (zoneMap.entryZoneConfigEntities?.[zoneKey] || {}) as Record<string, string>;
@@ -457,7 +492,7 @@ export const createDevicesRouter = (deps: DevicesRouterDependencies): Router => 
           const entityId = deviceEntityService.getPolygonZoneEntity(deviceId, type, index);
           if (entityId) return entityId;
         }
-        return EntityResolver.resolvePolygonZoneEntity(entityMappings, prefix, groupKey, key, template);
+        return EntityResolver.resolvePolygonZoneEntity(entityMappings, undefined, groupKey, key, template);
       };
 
       const addPolygonAvailability = (
@@ -548,7 +583,7 @@ export const createDevicesRouter = (deps: DevicesRouterDependencies): Router => 
       if (!polygonZone1Entity && zoneMap.polygonZoneEntities?.zone1) {
         polygonZone1Entity = EntityResolver.resolvePolygonZoneEntity(
           entityMappings,
-          prefix,
+          undefined,
           'polygonZoneEntities',
           'zone1',
           zoneMap.polygonZoneEntities.zone1
@@ -559,26 +594,46 @@ export const createDevicesRouter = (deps: DevicesRouterDependencies): Router => 
         polygonZonesAvailable = !!polygonEntry;
       }
 
-      // Check entry zone 1 entity existence - try device mapping first
-      let entryZone1BeginX: string | null = null;
-      if (hasDeviceMapping) {
-        const entryZoneSet = deviceEntityService.getZoneEntitySet(deviceId, 'entry', 1);
-        entryZone1BeginX = entryZoneSet?.beginX || null;
-      }
-      if (!entryZone1BeginX && zoneMap.entryZoneConfigEntities?.entry1) {
-        const entryEntities = zoneMap.entryZoneConfigEntities.entry1 as Record<string, string>;
-        const entryZoneSet = EntityResolver.resolveZoneEntitySet(
-          entityMappings,
-          prefix,
-          'entryZoneConfigEntities',
-          'entry1',
-          entryEntities
-        );
-        entryZone1BeginX = entryZoneSet?.beginX || null;
-      }
-      if (entryZone1BeginX) {
-        const entryEntry = entityRegistry.find((e) => e.entity_id === entryZone1BeginX);
-        entryZonesAvailable = !!entryEntry;
+      if (polygonOnlyEpl) {
+        let polygonEntry1Entity: string | null = null;
+        if (hasDeviceMapping) {
+          polygonEntry1Entity = deviceEntityService.getPolygonZoneEntity(deviceId, 'polygonEntry', 1);
+        }
+        if (!polygonEntry1Entity && zoneMap.polygonEntryEntities?.entry1) {
+          polygonEntry1Entity = EntityResolver.resolvePolygonZoneEntity(
+            entityMappings,
+            undefined,
+            'polygonEntryEntities',
+            'entry1',
+            zoneMap.polygonEntryEntities.entry1
+          );
+        }
+        if (polygonEntry1Entity) {
+          const entryEntry = entityRegistry.find((e) => e.entity_id === polygonEntry1Entity);
+          entryZonesAvailable = !!entryEntry;
+        }
+      } else {
+        // Check entry zone 1 entity existence - try device mapping first
+        let entryZone1BeginX: string | null = null;
+        if (hasDeviceMapping) {
+          const entryZoneSet = deviceEntityService.getZoneEntitySet(deviceId, 'entry', 1);
+          entryZone1BeginX = entryZoneSet?.beginX || null;
+        }
+        if (!entryZone1BeginX && zoneMap.entryZoneConfigEntities?.entry1) {
+          const entryEntities = zoneMap.entryZoneConfigEntities.entry1 as Record<string, string>;
+          const entryZoneSet = EntityResolver.resolveZoneEntitySet(
+            entityMappings,
+            undefined,
+            'entryZoneConfigEntities',
+            'entry1',
+            entryEntities
+          );
+          entryZone1BeginX = entryZoneSet?.beginX || null;
+        }
+        if (entryZone1BeginX) {
+          const entryEntry = entityRegistry.find((e) => e.entity_id === entryZone1BeginX);
+          entryZonesAvailable = !!entryEntry;
+        }
       }
 
       return res.json({ availability, polygonAvailability, polygonZonesAvailable, entryZonesAvailable });
@@ -590,10 +645,9 @@ export const createDevicesRouter = (deps: DevicesRouterDependencies): Router => 
 
   router.get('/:deviceId/zones', async (req, res) => {
     const { deviceId } = req.params;
-    const { profileId, entityNamePrefix, entityMappings: entityMappingsJson } = req.query;
-
-    if (!profileId || !entityNamePrefix) {
-      return res.status(400).json({ message: 'profileId and entityNamePrefix are required' });
+    const { profileId, entityMappings: entityMappingsJson } = req.query;
+    if (!profileId) {
+      return res.status(400).json({ message: 'profileId is required' });
     }
 
     const profile = profileLoader.getProfileById(profileId as string);
@@ -607,17 +661,16 @@ export const createDevicesRouter = (deps: DevicesRouterDependencies): Router => 
     }
 
     // Parse entityMappings if provided (JSON string in query param)
-    let entityMappings: EntityMappings | undefined;
-    if (entityMappingsJson && typeof entityMappingsJson === 'string') {
-      try {
-        entityMappings = JSON.parse(entityMappingsJson);
-      } catch {
-        logger.warn('Invalid entityMappings JSON in query');
-      }
+    const entityMappings = parseEntityMappings(entityMappingsJson, 'zones');
+    if (!hasRuntimeMappings(deviceId, entityMappings)) {
+      return res.status(409).json({
+        message: 'Device mapping not found. Run entity re-sync to create mappings.',
+        code: 'MAPPING_NOT_FOUND',
+      });
     }
 
     try {
-      const zones = await zoneReader.readZones(zoneMap, entityNamePrefix as string, entityMappings, deviceId);
+      const zones = await zoneReader.readZones(zoneMap, undefined, entityMappings, deviceId);
       return res.json({ zones });
     } catch (error) {
       logger.error({ error }, 'Failed to read zones');
@@ -628,15 +681,17 @@ export const createDevicesRouter = (deps: DevicesRouterDependencies): Router => 
   router.post('/:deviceId/zones', async (req, res) => {
     const { deviceId } = req.params;
     const profileId = (req.body?.profileId as string | undefined) ?? (req.body?.profile_id as string | undefined);
-    const entityNamePrefix = (req.body?.entityNamePrefix as string | undefined) ?? (req.body?.entity_name_prefix as string | undefined);
     const zones = (req.body?.zones as RoomConfig['zones']) ?? [];
     const entityMappings = req.body?.entityMappings as EntityMappings | undefined;
 
     if (!profileId) {
       return res.status(400).json({ message: 'profileId is required' });
     }
-    if (!entityNamePrefix) {
-      return res.status(400).json({ message: 'entityNamePrefix is required' });
+    if (!hasRuntimeMappings(deviceId, entityMappings)) {
+      return res.status(409).json({
+        message: 'Device mapping not found. Run entity re-sync to create mappings.',
+        code: 'MAPPING_NOT_FOUND',
+      });
     }
     const profile = profileLoader.getProfileById(profileId);
     if (!profile) {
@@ -649,7 +704,7 @@ export const createDevicesRouter = (deps: DevicesRouterDependencies): Router => 
     }
 
     try {
-      const result = await zoneWriter.applyZones(zoneMap, zones, entityNamePrefix, entityMappings, deviceId);
+      const result = await zoneWriter.applyZones(zoneMap, zones, undefined, entityMappings, deviceId);
       return res.json({ ok: result.ok, warnings: result.failures });
     } catch (error) {
       logger.error({ error }, 'Failed to apply zones');
@@ -664,10 +719,9 @@ export const createDevicesRouter = (deps: DevicesRouterDependencies): Router => 
    */
   router.get('/:deviceId/polygon-mode', async (req, res) => {
     const { deviceId } = req.params;
-    const { profileId, entityNamePrefix, entityMappings: entityMappingsJson } = req.query;
-
-    if (!profileId || !entityNamePrefix) {
-      return res.status(400).json({ message: 'profileId and entityNamePrefix are required' });
+    const { profileId, entityMappings: entityMappingsJson } = req.query;
+    if (!profileId) {
+      return res.status(400).json({ message: 'profileId is required' });
     }
 
     const profile = profileLoader.getProfileById(profileId as string);
@@ -680,6 +734,19 @@ export const createDevicesRouter = (deps: DevicesRouterDependencies): Router => 
       return res.json({ supported: false, enabled: false, controllable: false });
     }
 
+    // Firmware-version check first: polygon-only firmware has no mode toggle, and the
+    // legacy switch entity may linger in HA as a restored "unavailable" ghost that would
+    // otherwise be read as "polygon mode off". The registry sw_version is reliable even
+    // when the device is offline.
+    const firmwareVersion = await getDeviceFirmwareVersion(deviceId);
+    if (isPolygonOnlyDevice({
+      profileId: profile.id,
+      firmwareVersion,
+      model: (profile as unknown as { model?: string }).model,
+    })) {
+      return res.json({ supported: true, enabled: true, controllable: false });
+    }
+
     const entityMap = profile.entityMap as any;
     const entityTemplate = entityMap?.polygonZonesEnabledEntity;
 
@@ -687,13 +754,12 @@ export const createDevicesRouter = (deps: DevicesRouterDependencies): Router => 
     const hasDeviceMapping = deviceMappingStorage.hasMapping(deviceId);
 
     // Parse entityMappings if provided (JSON string in query param)
-    let entityMappings: EntityMappings | undefined;
-    if (entityMappingsJson && typeof entityMappingsJson === 'string') {
-      try {
-        entityMappings = JSON.parse(entityMappingsJson);
-      } catch {
-        logger.warn('Invalid entityMappings JSON in polygon-mode query');
-      }
+    const entityMappings = parseEntityMappings(entityMappingsJson, 'polygon-mode');
+    if (!hasRuntimeMappings(deviceId, entityMappings)) {
+      return res.status(409).json({
+        message: 'Device mapping not found. Run entity re-sync to create mappings.',
+        code: 'MAPPING_NOT_FOUND',
+      });
     }
 
     try {
@@ -705,7 +771,7 @@ export const createDevicesRouter = (deps: DevicesRouterDependencies): Router => 
       if (!switchEntityId) {
         switchEntityId = EntityResolver.resolve(
           entityMappings,
-          entityNamePrefix as string,
+          undefined,
           'polygonZonesEnabledEntity',
           entityTemplate
         );
@@ -720,7 +786,7 @@ export const createDevicesRouter = (deps: DevicesRouterDependencies): Router => 
         if (!polygonZoneEntity && entityMap?.polygonZoneEntities?.zone1) {
           polygonZoneEntity = EntityResolver.resolvePolygonZoneEntity(
             entityMappings,
-            entityNamePrefix as string,
+            undefined,
             'polygonZoneEntities',
             'zone1',
             entityMap.polygonZoneEntities.zone1
@@ -739,7 +805,7 @@ export const createDevicesRouter = (deps: DevicesRouterDependencies): Router => 
         return res.json({ supported: true, enabled: true, controllable: false });
       }
 
-      logger.info({ entityId: switchEntityId, entityNamePrefix, usedDeviceMapping: hasDeviceMapping }, 'Checking polygon mode entity');
+      logger.info({ entityId: switchEntityId, usedDeviceMapping: hasDeviceMapping }, 'Checking polygon mode entity');
 
       const states = await readTransport.getStates([switchEntityId]);
       const state = states.get(switchEntityId);
@@ -751,10 +817,42 @@ export const createDevicesRouter = (deps: DevicesRouterDependencies): Router => 
         statesMapSize: states.size
       }, 'Polygon mode entity state lookup result');
 
-      // If entity doesn't exist in Home Assistant, polygon zones are not supported
-      if (!state) {
-        logger.info({ entityId: switchEntityId }, 'Polygon mode entity not found - feature not available');
-        return res.json({ supported: false, enabled: false, controllable: true });
+      // If the old toggle entity no longer exists (or only lingers as a restored
+      // "unavailable" ghost after a polygon-only firmware update), fall back to
+      // polygon-only detection via the polygon zone text entities.
+      if (!state || isUnavailableState(state.state)) {
+        logger.info(
+          { entityId: switchEntityId, stateValue: state?.state ?? null },
+          'Polygon mode entity missing or unavailable - checking polygon-only zone entities'
+        );
+
+        let polygonZoneEntity: string | null = null;
+        if (hasDeviceMapping) {
+          polygonZoneEntity = deviceEntityService.getPolygonZoneEntity(deviceId, 'polygon', 1);
+        }
+        if (!polygonZoneEntity && entityMap?.polygonZoneEntities?.zone1) {
+          polygonZoneEntity = EntityResolver.resolvePolygonZoneEntity(
+            entityMappings,
+            undefined,
+            'polygonZoneEntities',
+            'zone1',
+            entityMap.polygonZoneEntities.zone1
+          );
+        }
+        if (!polygonZoneEntity) {
+          return res.json({ supported: false, enabled: false, controllable: true });
+        }
+
+        const polygonStates = await readTransport.getStates([polygonZoneEntity]);
+        const polygonState = polygonStates.get(polygonZoneEntity);
+        // Require a live polygon zone state: an offline pre-migration device reports
+        // every entity (including the real toggle) as unavailable, and must not be
+        // mistaken for a polygon-only device.
+        if (!polygonState || isReadinessUnavailableState(polygonState.state)) {
+          return res.json({ supported: false, enabled: false, controllable: true });
+        }
+
+        return res.json({ supported: true, enabled: true, controllable: false });
       }
 
       // Check if enabled (case-insensitive)
@@ -775,12 +873,17 @@ export const createDevicesRouter = (deps: DevicesRouterDependencies): Router => 
   router.post('/:deviceId/polygon-mode', async (req, res) => {
     const { deviceId } = req.params;
     const profileId = req.body?.profileId as string | undefined;
-    const entityNamePrefix = req.body?.entityNamePrefix as string | undefined;
     const enabled = req.body?.enabled as boolean | undefined;
     const entityMappings = req.body?.entityMappings as EntityMappings | undefined;
 
-    if (!profileId || !entityNamePrefix || enabled === undefined) {
-      return res.status(400).json({ message: 'profileId, entityNamePrefix, and enabled are required' });
+    if (!profileId || enabled === undefined) {
+      return res.status(400).json({ message: 'profileId and enabled are required' });
+    }
+    if (!hasRuntimeMappings(deviceId, entityMappings)) {
+      return res.status(409).json({
+        message: 'Device mapping not found. Run entity re-sync to create mappings.',
+        code: 'MAPPING_NOT_FOUND',
+      });
     }
 
     const profile = profileLoader.getProfileById(profileId);
@@ -791,7 +894,24 @@ export const createDevicesRouter = (deps: DevicesRouterDependencies): Router => 
     const entityMap = profile.entityMap as any;
 
     try {
-      await zoneWriter.setPolygonMode(entityMap, entityNamePrefix, enabled, entityMappings, deviceId);
+      // Polygon-only firmware has no mode toggle: writing the legacy switch would
+      // silently no-op against a ghost entity and revert on the next status read.
+      const firmwareVersion = await getDeviceFirmwareVersion(deviceId);
+      if (isPolygonOnlyDevice({
+        profileId: profile.id,
+        firmwareVersion,
+        model: (profile as unknown as { model?: string }).model,
+      })) {
+        if (!enabled) {
+          return res.status(409).json({
+            message: 'This firmware only supports polygon zones; rectangle mode is no longer available.',
+            code: 'POLYGON_ONLY_FIRMWARE',
+          });
+        }
+        return res.json({ ok: true, enabled: true });
+      }
+
+      await zoneWriter.setPolygonMode(entityMap, undefined, enabled, entityMappings, deviceId);
       return res.json({ ok: true, enabled });
     } catch (error) {
       logger.error({ error }, 'Failed to set polygon mode');
@@ -804,10 +924,9 @@ export const createDevicesRouter = (deps: DevicesRouterDependencies): Router => 
    */
   router.get('/:deviceId/polygon-zones', async (req, res) => {
     const { deviceId } = req.params;
-    const { profileId, entityNamePrefix, entityMappings: entityMappingsJson } = req.query;
-
-    if (!profileId || !entityNamePrefix) {
-      return res.status(400).json({ message: 'profileId and entityNamePrefix are required' });
+    const { profileId, entityMappings: entityMappingsJson } = req.query;
+    if (!profileId) {
+      return res.status(400).json({ message: 'profileId is required' });
     }
 
     const profile = profileLoader.getProfileById(profileId as string);
@@ -818,17 +937,16 @@ export const createDevicesRouter = (deps: DevicesRouterDependencies): Router => 
     const entityMap = profile.entityMap as any;
 
     // Parse entityMappings if provided (JSON string in query param)
-    let entityMappings: EntityMappings | undefined;
-    if (entityMappingsJson && typeof entityMappingsJson === 'string') {
-      try {
-        entityMappings = JSON.parse(entityMappingsJson);
-      } catch {
-        logger.warn('Invalid entityMappings JSON in query');
-      }
+    const entityMappings = parseEntityMappings(entityMappingsJson, 'polygon-zones');
+    if (!hasRuntimeMappings(deviceId, entityMappings)) {
+      return res.status(409).json({
+        message: 'Device mapping not found. Run entity re-sync to create mappings.',
+        code: 'MAPPING_NOT_FOUND',
+      });
     }
 
     try {
-      const zones = await zoneReader.readPolygonZones(entityMap, entityNamePrefix as string, entityMappings, deviceId);
+      const zones = await zoneReader.readPolygonZones(entityMap, undefined, entityMappings, deviceId);
       return res.json({ zones });
     } catch (error) {
       logger.error({ error }, 'Failed to read polygon zones');
@@ -842,12 +960,17 @@ export const createDevicesRouter = (deps: DevicesRouterDependencies): Router => 
   router.post('/:deviceId/polygon-zones', async (req, res) => {
     const { deviceId } = req.params;
     const profileId = req.body?.profileId as string | undefined;
-    const entityNamePrefix = req.body?.entityNamePrefix as string | undefined;
     const zones = req.body?.zones as ZonePolygon[] | undefined;
     const entityMappings = req.body?.entityMappings as EntityMappings | undefined;
 
-    if (!profileId || !entityNamePrefix) {
-      return res.status(400).json({ message: 'profileId and entityNamePrefix are required' });
+    if (!profileId) {
+      return res.status(400).json({ message: 'profileId is required' });
+    }
+    if (!hasRuntimeMappings(deviceId, entityMappings)) {
+      return res.status(409).json({
+        message: 'Device mapping not found. Run entity re-sync to create mappings.',
+        code: 'MAPPING_NOT_FOUND',
+      });
     }
 
     const profile = profileLoader.getProfileById(profileId);
@@ -876,7 +999,7 @@ export const createDevicesRouter = (deps: DevicesRouterDependencies): Router => 
           type === 'polygon' ? 'polygonZoneEntities'
             : type === 'polygonExclusion' ? 'polygonExclusionEntities'
               : 'polygonEntryEntities';
-        return EntityResolver.resolvePolygonZoneEntity(entityMappings, entityNamePrefix, groupKey, key, template);
+        return EntityResolver.resolvePolygonZoneEntity(entityMappings, undefined, groupKey, key, template);
       };
 
       const polygonMap = entityMap?.polygonZoneEntities as Record<string, string> | undefined;
@@ -966,7 +1089,7 @@ export const createDevicesRouter = (deps: DevicesRouterDependencies): Router => 
         }
       }
 
-      const result = await zoneWriter.applyPolygonZones(entityMap, zones ?? [], entityNamePrefix, entityMappings, deviceId);
+      const result = await zoneWriter.applyPolygonZones(entityMap, zones ?? [], undefined, entityMappings, deviceId);
       const combinedWarnings = [...warnings, ...result.failures];
       return res.json({ ok: result.ok, warnings: combinedWarnings });
     } catch (error) {

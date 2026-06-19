@@ -16,9 +16,28 @@ import { HeatmapOverlay } from '../components/HeatmapOverlay';
 import { ZoneStatsPanel } from '../components/ZoneStatsPanel';
 import { HourlyActivityChart } from '../components/HourlyActivityChart';
 import { ThemeSwitcher } from '../components/ThemeSwitcher';
+import { DisplaySettingsControls } from '../components/DisplaySettingsControls';
+import {
+  CanvasBottomToolbar,
+  CanvasMobileSheet,
+  CanvasToolbarButton,
+  CanvasTopBar,
+} from '../components/CanvasLayout';
 import { useDisplaySettings } from '../hooks/useDisplaySettings';
 import { useHeatmap } from '../hooks/useHeatmap';
+import { useIsMobileCanvas } from '../hooks/useMediaQuery';
 import { useDeviceMappings, useDeviceMapping } from '../contexts/DeviceMappingsContext';
+import { getDeviceIconUrl } from '../utils/deviceIcon';
+import { resolveCoverageFov } from '../utils/coverage';
+import { usesPolygonOnlyZones } from '../utils/firmware';
+import { resolveEntityPrefix } from '../utils/entityUtils';
+import {
+  buildCeilingExclusionZones,
+  buildCeilingSliceZones,
+  getCeilingSliceLineDepth,
+  getCeilingSlicePosition,
+  normalizeCeilingSliceConfig,
+} from '../utils/ceilingSlices';
 
 // Recording mode trail point
 interface RecordedPoint {
@@ -44,6 +63,8 @@ interface LiveTrackingPageProps {
   }>;
   onRoomChange?: (roomId: string | null, profileId: string | null) => void;
 }
+
+type MobileLiveSheet = 'details' | 'display' | 'zoom' | 'device' | 'navigation' | null;
 
 const normalizeAngle = (angle: number): number => {
   let normalized = ((angle % 360) + 360) % 360;
@@ -74,8 +95,6 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
   const [zoom, setZoom] = useState(1.1);
   const [panOffsetMm, setPanOffsetMm] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const [cursorPos, setCursorPos] = useState<{ x: number; y: number } | null>(null);
-  const [showMaxDistanceOverlay, setShowMaxDistanceOverlay] = useState(true);
-  const [showTriggerDistanceOverlay, setShowTriggerDistanceOverlay] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [smoothTracking, setSmoothTracking] = useState(true);
   const [showTrails, setShowTrails] = useState(false);
@@ -87,6 +106,7 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
   const [showDetailedTracking, setShowDetailedTracking] = useState(false);
   const [showDeviceSettings, setShowDeviceSettings] = useState(false);
   const [showRecommendations, setShowRecommendations] = useState(false);
+  const [activeMobileSheet, setActiveMobileSheet] = useState<MobileLiveSheet>(null);
   // Polygon mode state
   const [polygonModeStatus, setPolygonModeStatus] = useState<PolygonModeStatus>({
     supported: false,
@@ -102,13 +122,19 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
     showZones, setShowZones,
     showDeviceIcon, setShowDeviceIcon,
     showDeviceRadar, setShowDeviceRadar,
+    showMaxDistanceOverlay, setShowMaxDistanceOverlay,
+    showTriggerDistanceOverlay, setShowTriggerDistanceOverlay,
     showTargets, setShowTargets,
+    targetMarkerScale, setTargetMarkerScale,
+    showZoneLabels, setShowZoneLabels,
+    zoneLabelScale, setZoneLabelScale,
     showAlignedDirection, setShowAlignedDirection,
     clipRadarToWalls, setClipRadarToWalls,
     heatmapEnabled, setHeatmapEnabled,
     heatmapHours, setHeatmapHours,
     heatmapThreshold, setHeatmapThreshold,
   } = useDisplaySettings();
+  const isMobileCanvas = useIsMobileCanvas();
 
   const selectedRoom = useMemo(
     () => (selectedRoomId ? rooms.find((r) => r.id === selectedRoomId) ?? null : null),
@@ -119,14 +145,30 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
     () => profiles.find((p) => p.id === (selectedRoom?.profileId ?? selectedProfileId)) ?? null,
     [profiles, selectedRoom, selectedProfileId],
   );
+  const selectedDevice = useMemo(
+    () => (selectedRoom?.deviceId ? devices.find((d) => d.id === selectedRoom.deviceId) ?? null : null),
+    [devices, selectedRoom?.deviceId],
+  );
+  const deviceTypeLabel = useMemo(() => {
+    return selectedProfile?.label ?? 'Device';
+  }, [selectedProfile?.label]);
 
-  // Check if the selected room is using EP1
+  const deviceIconUrl = useMemo(
+    () => getDeviceIconUrl(selectedProfile, selectedRoom?.devicePlacement),
+    [selectedProfile, selectedRoom?.devicePlacement],
+  );
+
+  const coverageFov = useMemo(
+    () => resolveCoverageFov(selectedProfile, selectedRoom?.devicePlacement),
+    [selectedProfile, selectedRoom?.devicePlacement],
+  );
+  const effectiveCoverageMaxRangeMeters = coverageFov?.maxRangeMeters ?? selectedProfile?.limits?.maxRangeMeters;
+
+  const isCeilingMount = selectedRoom?.devicePlacement?.mountType === 'ceiling';
+  const isCeilingSliceMode =
+    selectedProfile?.id === 'everything_presence_pro' &&
+    selectedRoom?.devicePlacement?.mountType === 'ceiling';
   const isEP1 = selectedRoom?.profileId === 'everything_presence_one';
-
-  // Check if device supports tracking (EP Lite only for heatmap)
-  const supportsHeatmap = selectedProfile?.capabilities &&
-    (selectedProfile.capabilities as { tracking?: boolean }).tracking === true && !isEP1;
-
   const hasLiveStateForRoom = Boolean(
     liveState && selectedRoom?.deviceId && liveState.deviceId === selectedRoom.deviceId
   );
@@ -135,11 +177,133 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
     hasLiveStateForRoom && typeof liveState?.config?.installationAngle === 'number'
       ? liveState.config.installationAngle
       : 0;
+  const upsideDownMounting =
+    hasLiveStateForRoom && liveState?.config?.upsideDownMounting === true;
+
+  const heightCoverageConfig = useMemo(() => {
+    if (!selectedRoom?.devicePlacement || !isCeilingMount) return null;
+    if (!coverageFov) return null;
+    const heightMm = selectedRoom.devicePlacement.heightMm;
+    const pitchDeg = Number.isFinite(selectedRoom.devicePlacement.pitchDeg)
+      ? Number(selectedRoom.devicePlacement.pitchDeg)
+      : (selectedRoom.devicePlacement.mountType === 'ceiling' ? 90 : 0);
+    if (!Number.isFinite(heightMm) || !Number.isFinite(pitchDeg)) return null;
+    return {
+      enabled: true,
+      heightMm: Number(heightMm),
+      pitchDeg: Number(pitchDeg),
+      horizontalFovDeg: coverageFov.horizontalFovDeg,
+      verticalFovDeg: coverageFov.verticalFovDeg,
+      maxRangeMeters: coverageFov.maxRangeMeters,
+    };
+  }, [coverageFov, selectedRoom?.devicePlacement, isCeilingMount]);
+  const ceilingSliceConfig = useMemo(
+    () => normalizeCeilingSliceConfig(
+      selectedRoom?.metadata?.ceilingSliceConfig,
+      (selectedProfile?.limits?.maxRangeMeters ?? 6) * 1000,
+      true,
+    ),
+    [selectedProfile?.limits?.maxRangeMeters, selectedRoom?.metadata?.ceilingSliceConfig],
+  );
+  const deviceLocalToRoom = useCallback((deviceX: number, deviceY: number) => {
+    if (!selectedRoom?.devicePlacement) {
+      return { x: deviceX, y: deviceY };
+    }
+    const { x, y, rotationDeg } = selectedRoom.devicePlacement;
+    const angleRad = (((rotationDeg ?? 0) + installationAngle) * Math.PI) / 180;
+    const cos = Math.cos(angleRad);
+    const sin = Math.sin(angleRad);
+    const localX = upsideDownMounting ? -deviceX : deviceX;
+    return {
+      x: localX * cos - deviceY * sin + x,
+      y: localX * sin + deviceY * cos + y,
+    };
+  }, [installationAngle, selectedRoom?.devicePlacement, upsideDownMounting]);
+
+  const showCoverageOverlay = showDeviceRadar;
+
+  // Check if device supports tracking (EP Lite only for heatmap)
+  const supportsHeatmap = selectedProfile?.capabilities &&
+    (selectedProfile.capabilities as { tracking?: boolean }).tracking === true && !isEP1;
 
   // Device mappings context - used to check if device has valid entity mappings
   // useDeviceMapping triggers loading the mapping into cache, useDeviceMappings provides the check
   const { hasValidMappings } = useDeviceMappings();
   const { mapping: deviceMapping, loading: mappingLoading } = useDeviceMapping(selectedRoom?.deviceId);
+  const lastZonesFetchedRoomId = React.useRef<string | null>(null);
+  const ceilingSliceDisplayZones = useMemo(
+    () => buildCeilingSliceZones(
+      ceilingSliceConfig,
+      {},
+      'display',
+      false,
+      heightCoverageConfig,
+      (selectedProfile?.limits?.maxRangeMeters ?? 6) * 1000,
+    ),
+    [ceilingSliceConfig, heightCoverageConfig, selectedProfile?.limits?.maxRangeMeters],
+  );
+  const ceilingExclusionDisplayZones = useMemo(
+    () => buildCeilingExclusionZones(
+      ceilingSliceConfig,
+      {},
+      'display',
+      false,
+      heightCoverageConfig,
+      (selectedProfile?.limits?.maxRangeMeters ?? 6) * 1000,
+    ),
+    [ceilingSliceConfig, heightCoverageConfig, selectedProfile?.limits?.maxRangeMeters],
+  );
+  const displayPolygonZones = isCeilingSliceMode ? [...ceilingSliceDisplayZones, ...ceilingExclusionDisplayZones] : polygonZones;
+  const polygonOnlyZones = useMemo(() => (
+    usesPolygonOnlyZones(
+      selectedDevice?.firmwareVersion ?? deviceMapping?.firmwareVersion ?? null,
+      selectedDevice?.model ?? selectedProfile?.label ?? null,
+    ) === true
+  ), [
+    deviceMapping?.firmwareVersion,
+    selectedDevice?.firmwareVersion,
+    selectedDevice?.model,
+    selectedProfile?.label,
+  ]);
+  const displayedRectZones = polygonOnlyZones ? [] : selectedRoom?.zones ?? [];
+  const getZoneLabel = useCallback((zoneNum: number): string => {
+    const candidates = [`Zone ${zoneNum}`, `zone${zoneNum}`, `zone_${zoneNum}`, `zone-${zoneNum}`];
+    const source = polygonModeStatus.enabled ? displayPolygonZones : displayedRectZones;
+    const regularZones = source.filter((zone) => zone.type === 'regular');
+    const matchingZone =
+      source.find((zone) => candidates.includes(zone.id)) ??
+      regularZones[zoneNum - 1];
+
+    if (isCeilingSliceMode) {
+      return matchingZone?.label || `Zone ${zoneNum}`;
+    }
+
+    for (const candidate of candidates) {
+      const label = deviceMapping?.zoneLabels?.[candidate];
+      if (label) return label;
+    }
+
+    if (matchingZone?.id && deviceMapping?.zoneLabels?.[matchingZone.id]) {
+      return deviceMapping.zoneLabels[matchingZone.id];
+    }
+
+    return matchingZone?.label || `Zone ${zoneNum}`;
+  }, [
+    deviceMapping?.zoneLabels,
+    displayPolygonZones,
+    displayedRectZones,
+    isCeilingSliceMode,
+    polygonModeStatus.enabled,
+  ]);
+  const zoneOccupancyNumbers = useMemo(() => {
+    const configuredMax = selectedProfile?.limits?.maxZones ?? 4;
+    const liveMax = Object.keys(liveState?.zoneOccupancy ?? {}).reduce((max, key) => {
+      const match = key.match(/^zone(\d+)$/);
+      return match ? Math.max(max, Number(match[1])) : max;
+    }, 0);
+    const count = Math.max(configuredMax, liveMax, 1);
+    return Array.from({ length: count }, (_, index) => index + 1);
+  }, [liveState?.zoneOccupancy, selectedProfile?.limits?.maxZones]);
   // Check validity: mapping must be loaded AND schema versions must match
   // If profile has a schemaVersion, the mapping must have a matching profileSchemaVersion
   // This ensures users are prompted to resync when profile schema changes
@@ -158,10 +322,18 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
 
   // Derive entityNamePrefix for heatmap
   const entityNamePrefix = useMemo(() => {
-    if (selectedRoom?.entityNamePrefix) return selectedRoom.entityNamePrefix;
-    const device = devices.find(d => d.id === selectedRoom?.deviceId);
-    return device?.entityNamePrefix ?? null;
-  }, [selectedRoom, devices]);
+    return resolveEntityPrefix({
+      entityMappings: selectedRoom?.entityMappings,
+      entityNamePrefix: selectedRoom?.entityNamePrefix,
+      mappingPrefix: deviceMapping?.esphomeNodeName,
+      devicePrefix: selectedDevice?.entityNamePrefix,
+    });
+  }, [
+    deviceMapping?.esphomeNodeName,
+    selectedDevice?.entityNamePrefix,
+    selectedRoom?.entityMappings,
+    selectedRoom?.entityNamePrefix,
+  ]);
 
   // Heatmap data - skip entityMappings if device has valid mappings stored
   const { data: heatmapData, loading: heatmapLoading, refresh: refreshHeatmap } = useHeatmap({
@@ -391,10 +563,9 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
     };
   }, [propTargetPositions, smoothTracking, showLiveOverlays]);
 
-  // Fetch existing zones from device when room is loaded
-  // Using ref to prevent re-fetching for the same room
-  const lastZonesFetchedRoomId = React.useRef<string | null>(null);
   useEffect(() => {
+    let cancelled = false;
+
     const loadZonesFromDevice = async () => {
       if (!selectedRoom || !selectedRoom.deviceId || !selectedRoom.profileId) {
         return;
@@ -410,29 +581,41 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
         return;
       }
 
-      // Try to get entityNamePrefix from the room, or look it up from devices
-      let entityNamePrefix = selectedRoom.entityNamePrefix;
-      if (!entityNamePrefix) {
-        const device = devices.find(d => d.id === selectedRoom.deviceId);
-        entityNamePrefix = device?.entityNamePrefix;
-      }
+      const entityNamePrefix = resolveEntityPrefix({
+        entityMappings: selectedRoom.entityMappings,
+        entityNamePrefix: selectedRoom.entityNamePrefix,
+        mappingPrefix: deviceMapping?.esphomeNodeName,
+        devicePrefix: selectedDevice?.entityNamePrefix,
+      });
 
       if (!entityNamePrefix) {
         return;
       }
 
-      // Mark as fetched before the async call to prevent duplicate requests
-      lastZonesFetchedRoomId.current = selectedRoom.id;
-
       try {
         // Skip entityMappings if device has valid mappings stored
         const entityMappingsToUse = deviceHasValidMappings ? undefined : selectedRoom.entityMappings;
+        if (polygonOnlyZones) {
+          lastZonesFetchedRoomId.current = selectedRoom.id;
+          return;
+        }
         const deviceZones = await fetchZonesFromDevice(
           selectedRoom.deviceId,
           selectedRoom.profileId,
           entityNamePrefix,
           entityMappingsToUse
         );
+
+        if (cancelled) {
+          return;
+        }
+
+        lastZonesFetchedRoomId.current = selectedRoom.id;
+
+        // Avoid replacing known-good stored zones with a transient empty device read.
+        if (deviceZones.length === 0 && (selectedRoom.zones?.length ?? 0) > 0) {
+          return;
+        }
 
         // Always sync device zones to local storage (device is source of truth)
         const updatedRoom = { ...selectedRoom, zones: deviceZones };
@@ -450,40 +633,48 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
     };
 
     loadZonesFromDevice();
-  }, [selectedRoom?.id, selectedRoom?.deviceId, selectedRoom?.profileId, selectedRoom?.entityNamePrefix, devices, mappingLoading, deviceHasValidMappings, selectedRoom]);
 
-  // Fetch polygon mode status when room changes
-  // Using refs to prevent re-fetching when entityMappings changes
-  const lastPolygonModeRoomId = React.useRef<string | null>(null);
-  const lastPolygonModeMappingsReady = React.useRef<boolean>(false);
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    selectedRoom?.id,
+    selectedRoom?.deviceId,
+    selectedRoom?.profileId,
+    selectedRoom?.entityNamePrefix,
+    selectedRoom?.entityMappings,
+    selectedRoom?.zones,
+    devices,
+    mappingLoading,
+    deviceHasValidMappings,
+    polygonOnlyZones,
+  ]);
+
   useEffect(() => {
+    setPolygonModeStatus({ supported: false, enabled: false, controllable: false });
+    setPolygonZones([]);
+  }, [selectedRoom?.id]);
+
+  useEffect(() => {
+    let cancelled = false;
+
     const loadPolygonModeStatus = async () => {
       if (!selectedRoom?.deviceId || !selectedRoom?.profileId) {
         setPolygonModeStatus({ supported: false, enabled: false, controllable: false });
         return;
       }
 
-      // Only fetch once per room, or when mappings become ready for the first time
-      const mappingsReady = !mappingLoading;
-      if (selectedRoom.id === lastPolygonModeRoomId.current &&
-          lastPolygonModeMappingsReady.current === mappingsReady) {
-        return;
-      }
-
-      let entityNamePrefix = selectedRoom.entityNamePrefix;
-      if (!entityNamePrefix) {
-        const device = devices.find(d => d.id === selectedRoom.deviceId);
-        entityNamePrefix = device?.entityNamePrefix;
-      }
+      const entityNamePrefix = resolveEntityPrefix({
+        entityMappings: selectedRoom.entityMappings,
+        entityNamePrefix: selectedRoom.entityNamePrefix,
+        mappingPrefix: deviceMapping?.esphomeNodeName,
+        devicePrefix: selectedDevice?.entityNamePrefix,
+      });
 
       if (!entityNamePrefix) {
         setPolygonModeStatus({ supported: false, enabled: false, controllable: false });
         return;
       }
-
-      // Mark as fetched before the async call
-      lastPolygonModeRoomId.current = selectedRoom.id;
-      lastPolygonModeMappingsReady.current = mappingsReady;
 
       try {
         // Skip entityMappings if device has valid mappings stored
@@ -494,47 +685,64 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
           entityNamePrefix,
           entityMappingsToUse
         );
-        setPolygonModeStatus(status);
+        if (!cancelled) {
+          // Polygon-only firmware has no rectangle mode: never let a stale mode toggle
+          // (e.g. a ghost switch entity left behind by the firmware update) report
+          // rectangle mode, which would hide every zone overlay.
+          if (polygonOnlyZones && (!status.enabled || !status.supported)) {
+            setPolygonModeStatus({ supported: true, enabled: true, controllable: false });
+          } else {
+            setPolygonModeStatus(status);
+          }
+        }
       } catch (err) {
-        setPolygonModeStatus({ supported: false, enabled: false, controllable: false });
+        if (!cancelled) {
+          if (polygonOnlyZones) {
+            setPolygonModeStatus({ supported: true, enabled: true, controllable: false });
+          } else {
+            setPolygonModeStatus({ supported: false, enabled: false, controllable: false });
+          }
+        }
       }
     };
 
     loadPolygonModeStatus();
-  }, [selectedRoom?.id, selectedRoom?.deviceId, selectedRoom?.profileId, selectedRoom?.entityNamePrefix, devices, mappingLoading, deviceHasValidMappings, selectedRoom]);
 
-  // Fetch polygon zones when polygon mode is enabled
-  // Using refs to prevent re-fetching when entityMappings changes
-  const lastPolygonZonesRoomId = React.useRef<string | null>(null);
-  const lastPolygonZonesEnabled = React.useRef<boolean>(false);
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    selectedRoom?.id,
+    selectedRoom?.deviceId,
+    selectedRoom?.profileId,
+    selectedRoom?.entityNamePrefix,
+    selectedRoom?.entityMappings,
+    devices,
+    mappingLoading,
+    deviceHasValidMappings,
+    polygonOnlyZones,
+  ]);
+
   useEffect(() => {
+    let cancelled = false;
+
     const loadPolygonZones = async () => {
       if (!polygonModeStatus.enabled || !selectedRoom?.deviceId || !selectedRoom?.profileId) {
         setPolygonZones([]);
-        lastPolygonZonesEnabled.current = false;
         return;
       }
 
-      // Only fetch once per room when polygon mode becomes enabled
-      if (selectedRoom.id === lastPolygonZonesRoomId.current &&
-          lastPolygonZonesEnabled.current === polygonModeStatus.enabled) {
-        return;
-      }
-
-      let entityNamePrefix = selectedRoom.entityNamePrefix;
-      if (!entityNamePrefix) {
-        const device = devices.find(d => d.id === selectedRoom.deviceId);
-        entityNamePrefix = device?.entityNamePrefix;
-      }
+      const entityNamePrefix = resolveEntityPrefix({
+        entityMappings: selectedRoom.entityMappings,
+        entityNamePrefix: selectedRoom.entityNamePrefix,
+        mappingPrefix: deviceMapping?.esphomeNodeName,
+        devicePrefix: selectedDevice?.entityNamePrefix,
+      });
 
       if (!entityNamePrefix) {
         setPolygonZones([]);
         return;
       }
-
-      // Mark as fetched before the async call
-      lastPolygonZonesRoomId.current = selectedRoom.id;
-      lastPolygonZonesEnabled.current = polygonModeStatus.enabled;
 
       try {
         // Skip entityMappings if device has valid mappings stored
@@ -545,14 +753,31 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
           entityNamePrefix,
           entityMappingsToUse
         );
-        setPolygonZones(zones);
+        if (!cancelled) {
+          setPolygonZones(zones);
+        }
       } catch (err) {
-        setPolygonZones([]);
+        if (!cancelled) {
+          setPolygonZones([]);
+        }
       }
     };
 
     loadPolygonZones();
-  }, [polygonModeStatus.enabled, selectedRoom?.id, selectedRoom?.deviceId, selectedRoom?.profileId, selectedRoom?.entityNamePrefix, devices, deviceHasValidMappings, selectedRoom]);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    polygonModeStatus.enabled,
+    selectedRoom?.id,
+    selectedRoom?.deviceId,
+    selectedRoom?.profileId,
+    selectedRoom?.entityNamePrefix,
+    selectedRoom?.entityMappings,
+    devices,
+    deviceHasValidMappings,
+  ]);
 
   const handleAutoZoom = useCallback(() => {
     if (!selectedRoom || !selectedRoom.roomShell || !selectedRoom.roomShell.points.length) {
@@ -576,6 +801,14 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
     setPanOffsetMm({ x: (minX + maxX) / 2, y: (minY + maxY) / 2 });
   }, [selectedRoom, rangeMm]);
 
+  const handleRoomSelection = useCallback((roomId: string | null) => {
+    setSelectedRoomId(roomId);
+    const room = rooms.find((candidate) => candidate.id === roomId);
+    const newProfileId = room?.profileId ?? selectedProfileId;
+    if (room?.profileId) setSelectedProfileId(room.profileId);
+    onRoomChange?.(roomId, newProfileId);
+  }, [onRoomChange, rooms, selectedProfileId]);
+
   // Auto-zoom when room changes (only on room ID change, not on every handleAutoZoom recreation)
   // Using a ref to track if we've already auto-zoomed for this room
   const lastAutoZoomedRoomId = React.useRef<string | null>(null);
@@ -585,6 +818,12 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
       handleAutoZoom();
     }
   }, [selectedRoom?.id, selectedRoom?.roomShell?.points?.length, handleAutoZoom]);
+
+  useEffect(() => {
+    if (!isMobileCanvas && activeMobileSheet) {
+      setActiveMobileSheet(null);
+    }
+  }, [activeMobileSheet, isMobileCanvas]);
 
   // Calculate distance indicator position (for EP One)
   const distanceIndicatorPos = useMemo(() => {
@@ -690,18 +929,72 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
         </div>
       )}
 
+      <div className="md:hidden">
+        <CanvasTopBar
+          left={onBack ? (
+            <button
+              type="button"
+              onClick={onBack}
+              className="min-h-[40px] rounded-lg border border-slate-700 bg-slate-900 px-3 text-sm font-semibold text-slate-100"
+            >
+              Back
+            </button>
+          ) : onNavigate ? (
+            <button
+              type="button"
+              onClick={() => setActiveMobileSheet('navigation')}
+              className="min-h-[40px] rounded-lg border border-slate-700 bg-slate-900 px-3 text-sm font-semibold text-slate-100"
+            >
+              Menu
+            </button>
+          ) : null}
+          title={rooms.length > 0 ? (
+            <select
+              className="w-full rounded-lg border border-slate-700 bg-slate-900 px-2 py-1.5 text-sm font-semibold text-slate-100 focus:border-aqua-500 focus:outline-none focus:ring-1 focus:ring-aqua-500/50"
+              value={selectedRoomId ?? ''}
+              onChange={(event) => handleRoomSelection(event.target.value || null)}
+            >
+              {rooms.map((room) => (
+                <option key={room.id} value={room.id}>
+                  {room.name}
+                </option>
+              ))}
+            </select>
+          ) : (
+            loading ? 'Loading' : 'Live Dashboard'
+          )}
+          subtitle={rooms.length > 0 ? undefined : selectedProfile?.label ?? (selectedRoom ? 'Live tracking' : 'Select a room')}
+          right={(
+            <button
+              type="button"
+              onClick={() => setActiveMobileSheet('details')}
+              className="flex min-h-[40px] items-center gap-2 rounded-lg border border-slate-700 bg-slate-900 px-3 text-xs font-semibold text-slate-100"
+            >
+              <span className={`h-2.5 w-2.5 rounded-full ${
+                presenceAvailability === 'unavailable'
+                  ? 'bg-amber-500'
+                  : liveState?.presence
+                  ? 'bg-emerald-500'
+                  : 'bg-slate-600'
+              }`} />
+              Status
+            </button>
+          )}
+        />
+      </div>
+
       {/* Navigation (top left) */}
       {onBack && (
         <button
           onClick={onBack}
-          className="absolute top-6 left-6 z-40 group rounded-xl border border-slate-700/50 bg-slate-900/90 backdrop-blur px-4 py-2.5 text-sm font-semibold text-slate-100 shadow-lg transition-all hover:border-slate-600 hover:bg-slate-800 hover:shadow-xl active:scale-95"
+          className="absolute top-6 left-6 z-40 hidden group rounded-xl border border-slate-700/50 bg-slate-900/90 backdrop-blur px-4 py-2.5 text-sm font-semibold text-slate-100 shadow-lg transition-all hover:border-slate-600 hover:bg-slate-800 hover:shadow-xl active:scale-95 md:block"
         >
           <span className="inline-block transition-transform group-hover:-translate-x-0.5">←</span> Back
         </button>
       )}
 
       {!onBack && onNavigate && (
-        <div className="absolute top-6 left-6 z-40">
+        <div className="absolute top-6 left-6 z-40 hidden md:block">
           <button
             onClick={() => setShowNavMenu(!showNavMenu)}
             className="group rounded-xl border border-slate-700/50 bg-slate-900/90 backdrop-blur px-4 py-2.5 text-sm font-semibold text-slate-100 shadow-lg transition-all hover:border-slate-600 hover:bg-slate-800 hover:shadow-xl active:scale-95"
@@ -822,10 +1115,10 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
           }}
         >
           <ZoneCanvas
-            zones={selectedRoom.zones ?? []}
+            zones={displayedRectZones}
             onZonesChange={() => {}}
             // Polygon zones support - show polygon zones when polygon mode is enabled
-            polygonZones={polygonZones}
+            polygonZones={displayPolygonZones}
             onPolygonZonesChange={() => {}}
             polygonMode={polygonModeStatus.enabled}
             selectedId={null}
@@ -836,30 +1129,35 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
             zoom={zoom}
             panOffsetMm={panOffsetMm}
             onPanChange={(next) => setPanOffsetMm(next)}
+            onZoomChange={setZoom}
+            touchPanEnabled
             onCanvasMove={(pt) => setCursorPos(pt)}
             roomShell={selectedRoom.roomShell}
             roomShellFillMode={selectedRoom.roomShellFillMode}
             floorMaterial={selectedRoom.floorMaterial}
             devicePlacement={selectedRoom.devicePlacement}
             installationAngle={installationAngle}
-            fieldOfViewDeg={selectedProfile?.limits?.fieldOfViewDegrees}
-            maxRangeMeters={selectedProfile?.limits?.maxRangeMeters}
-            deviceIconUrl={selectedProfile?.iconUrl}
+            fieldOfViewDeg={coverageFov?.horizontalFovDeg ?? selectedProfile?.limits?.fieldOfViewDegrees}
+            maxRangeMeters={effectiveCoverageMaxRangeMeters}
+            deviceIconUrl={deviceIconUrl}
+            heightCoverage={showCoverageOverlay ? (heightCoverageConfig ?? undefined) : undefined}
+            showRadar={showCoverageOverlay && !isCeilingMount}
             clipRadarToWalls={clipRadarToWalls}
-            showRadar={showDeviceRadar}
             furniture={selectedRoom.furniture ?? []}
             doors={selectedRoom.doors ?? []}
-            zoneLabels={deviceMapping?.zoneLabels}
+            zoneLabels={isCeilingSliceMode ? undefined : deviceMapping?.zoneLabels}
             showWalls={showWalls}
             showFurniture={showFurniture}
             showDoors={showDoors}
             showZones={showZones && showLiveOverlays}
+            showZoneLabels={showZoneLabels}
+            zoneLabelScale={zoneLabelScale}
             showDevice={showDeviceIcon}
             renderOverlay={({ toCanvas, roomShellPoints, devicePlacement: devicePlacementFromCanvas, fieldOfViewDeg }) => {
               // Heatmap overlay (renders behind everything else)
               // Pass devicePlacement to transform device-relative coordinates to room coordinates
               const heatmapOverlay = showLiveOverlays ? (
-                <HeatmapOverlay data={heatmapData} visible={heatmapEnabled} toCanvas={toCanvas} devicePlacement={selectedRoom?.devicePlacement} installationAngle={installationAngle} intensityThreshold={heatmapThreshold} roomShellPoints={roomShellPoints} />
+                <HeatmapOverlay data={heatmapData} visible={heatmapEnabled} toCanvas={toCanvas} devicePlacement={selectedRoom?.devicePlacement} installationAngle={installationAngle} upsideDownMounting={upsideDownMounting} intensityThreshold={heatmapThreshold} roomShellPoints={roomShellPoints} />
               ) : null;
 
               // Define colors for each target (up to 3 targets)
@@ -932,8 +1230,84 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
                 </g>
               ) : null;
 
+              const ceilingTargetElements = showTargets && isCeilingMount && liveState?.targets && liveState.targets.length > 0 ? (
+                <g>
+                  {liveState.targets.map((target) => {
+                    if (target.x === null || target.y === null) return null;
+                    if (target.x === 0 && target.y === 0 && target.active !== true) return null;
+                    const lateral = getCeilingSlicePosition(target, ceilingSliceConfig);
+                    if (lateral === null) return null;
+                    const depth = getCeilingSliceLineDepth(lateral, ceilingSliceConfig, heightCoverageConfig, (selectedProfile?.limits?.maxRangeMeters ?? 6) * 1000);
+                    if (!depth) return null;
+                    const endpoints = ceilingSliceConfig.axis === 'x'
+                      ? [
+                          deviceLocalToRoom(lateral, depth.min),
+                          deviceLocalToRoom(lateral, depth.max),
+                        ]
+                      : [
+                          deviceLocalToRoom(depth.min, lateral),
+                          deviceLocalToRoom(depth.max, lateral),
+                        ];
+                    const start = toCanvas(endpoints[0]);
+                    const end = toCanvas(endpoints[1]);
+                    const label = toCanvas(deviceLocalToRoom(
+                      ceilingSliceConfig.axis === 'x' ? lateral : 0,
+                      ceilingSliceConfig.axis === 'x' ? 0 : lateral,
+                    ));
+                    const colorIndex = (target.id - 1) % targetColors.length;
+                    const color = targetColors[colorIndex];
+
+                    return (
+                      <g key={`ceiling-target-${target.id}`}>
+                        <line
+                          x1={start.x}
+                          y1={start.y}
+                          x2={end.x}
+                          y2={end.y}
+                          stroke="rgba(15, 23, 42, 0.85)"
+                          strokeWidth={8 * targetMarkerScale}
+                          strokeLinecap="round"
+                          opacity={0.9}
+                        />
+                        <line
+                          x1={start.x}
+                          y1={start.y}
+                          x2={end.x}
+                          y2={end.y}
+                          stroke={color.fill}
+                          strokeWidth={4 * targetMarkerScale}
+                          strokeLinecap="round"
+                          opacity={0.95}
+                          strokeDasharray="10 7"
+                        />
+                        <circle
+                          cx={label.x}
+                          cy={label.y}
+                          r={8 * targetMarkerScale}
+                          fill={color.fill}
+                          stroke="white"
+                          strokeWidth={2 * targetMarkerScale}
+                        />
+                        <text
+                          x={label.x}
+                          y={label.y - (14 * targetMarkerScale)}
+                          textAnchor="middle"
+                          fill="white"
+                          fontSize={12 * targetMarkerScale}
+                          fontWeight="bold"
+                          className="pointer-events-none"
+                          style={{ filter: 'drop-shadow(0 1px 2px rgb(0 0 0 / 0.9))' }}
+                        >
+                          T{target.id}
+                        </text>
+                      </g>
+                    );
+                  })}
+                </g>
+              ) : null;
+
               // Render live target positions (EP Lite with tracking)
-              const targetElements = showTargets && displayTargetPositions.length > 0 ? (
+              const targetElements = !isCeilingMount && showTargets && displayTargetPositions.length > 0 ? (
                 <g>
                   {/* Render trails first (so they appear behind targets) */}
                   {showTrails && displayTargetPositions.map((target) => {
@@ -1000,28 +1374,28 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
                         <circle
                           cx={cx}
                           cy={cy}
-                          r={25}
+                          r={25 * targetMarkerScale}
                           fill={color.fillOpacity}
                           stroke={color.fill}
-                          strokeWidth={2}
+                          strokeWidth={2 * targetMarkerScale}
                           className="animate-pulse"
                         />
                         {/* Inner solid dot */}
                         <circle
                           cx={cx}
                           cy={cy}
-                          r={10}
+                          r={10 * targetMarkerScale}
                           fill={color.fill}
                           stroke="white"
-                          strokeWidth={2}
+                          strokeWidth={2 * targetMarkerScale}
                         />
                         {/* Target ID label */}
                         <text
                           x={cx}
-                          y={cy - 35}
+                          y={cy - (35 * targetMarkerScale)}
                           textAnchor="middle"
                           fill="white"
-                          fontSize="12"
+                          fontSize={12 * targetMarkerScale}
                           fontWeight="bold"
                           className="pointer-events-none"
                         >
@@ -1111,6 +1485,7 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
                     {recordedTrailOverlay}
 
                     {/* Targets (if any) */}
+                    {ceilingTargetElements}
                     {targetElements}
 
                     {/* Max Distance Arc */}
@@ -1120,7 +1495,7 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
                         devicePlacement={selectedRoom.devicePlacement}
                         toCanvas={toCanvas}
                         rangeMm={rangeMm}
-                        fieldOfViewDeg={selectedProfile.limits?.fieldOfViewDegrees ?? 120}
+                        fieldOfViewDeg={coverageFov?.horizontalFovDeg ?? selectedProfile.limits?.fieldOfViewDegrees ?? 120}
                         color="#3b82f6"
                         fillOpacity={0.08}
                         strokeOpacity={0.3}
@@ -1192,18 +1567,13 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
           />
 
           {/* Floating Room Selector (top center) */}
-          <div className="absolute top-6 left-1/2 -translate-x-1/2 z-40 flex items-center gap-2 rounded-xl border border-slate-700/50 bg-slate-900/90 backdrop-blur px-4 py-2.5 text-sm text-slate-200 shadow-xl">
+          <div className="absolute top-6 left-1/2 z-40 hidden -translate-x-1/2 items-center gap-2 rounded-xl border border-slate-700/50 bg-slate-900/90 backdrop-blur px-4 py-2.5 text-sm text-slate-200 shadow-xl md:flex">
             <span className="text-slate-400 font-medium">Room:</span>
             <select
               className="rounded-lg border border-slate-700 bg-slate-800/70 px-3 py-1.5 text-slate-100 transition-colors focus:border-aqua-500 focus:ring-1 focus:ring-aqua-500/50 focus:outline-none font-medium"
               value={selectedRoomId ?? ''}
               onChange={(e) => {
-                const id = e.target.value || null;
-                setSelectedRoomId(id);
-                const room = rooms.find((r) => r.id === id);
-                const newProfileId = room?.profileId ?? selectedProfileId;
-                if (room?.profileId) setSelectedProfileId(room.profileId);
-                onRoomChange?.(id, newProfileId);
+                handleRoomSelection(e.target.value || null);
               }}
             >
               {rooms.map((r) => (
@@ -1215,7 +1585,11 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
           </div>
 
           {/* Live State Info Panel (or EP1 Info Stack) */}
-          <div className="absolute top-24 right-6 z-40 w-72 max-w-full flex flex-col gap-3">
+          <div className="absolute top-24 right-6 bottom-28 z-40 hidden w-72 max-w-full md:block">
+            <div className="live-dashboard-rail relative h-full">
+              <div className="live-dashboard-rail__fade-top" />
+              <div className="live-dashboard-rail__fade-bottom" />
+              <div className="live-dashboard-rail__scroll h-full space-y-3 overflow-y-auto pr-2 pb-2">
             {/* Main Status Panel */}
             <div className="rounded-xl border border-slate-700/50 bg-slate-900/90 backdrop-blur p-4 text-sm text-slate-200 shadow-xl">
               <div className="flex items-center gap-2 mb-3">
@@ -1345,11 +1719,11 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
                     {/* Show polygon zones when polygon mode is enabled, otherwise show rectangle zones */}
                     {polygonModeStatus.enabled ? (
                       // Polygon zones legend
-                      polygonZones.filter(z => z.type === 'regular').length > 0 && (
+                      displayPolygonZones.filter(z => z.type === 'regular').length > 0 && (
                         <div className="flex flex-wrap items-center gap-2 text-[11px]">
                           {(() => {
                             const regularZoneColors = ['#3b82f6', '#8b5cf6', '#ec4899', '#f59e0b', '#06b6d4'];
-                            const regularZones = polygonZones.filter(z => z.type === 'regular');
+                            const regularZones = displayPolygonZones.filter(z => z.type === 'regular');
 
                             return regularZones.map((zone, index) => (
                               <div key={zone.id} className="flex items-center gap-1.5">
@@ -1357,7 +1731,7 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
                                   className="w-3 h-3 rounded border border-white/50"
                                   style={{ backgroundColor: regularZoneColors[index % regularZoneColors.length] }}
                                 />
-                                <span className="text-slate-300">{deviceMapping?.zoneLabels?.[zone.id] || zone.label || zone.id}</span>
+                                <span className="text-slate-300">{getZoneLabel(index + 1)}</span>
                               </div>
                             ));
                           })()}
@@ -1365,11 +1739,11 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
                       )
                     ) : (
                       // Rectangle zones legend
-                      selectedRoom?.zones && selectedRoom.zones.filter(z => z.type === 'regular').length > 0 && (
+                      displayedRectZones.filter(z => z.type === 'regular').length > 0 && (
                         <div className="flex flex-wrap items-center gap-2 text-[11px]">
                           {(() => {
                             const regularZoneColors = ['#3b82f6', '#8b5cf6', '#ec4899', '#f59e0b', '#06b6d4'];
-                            const regularZones = selectedRoom.zones.filter(z => z.type === 'regular');
+                            const regularZones = displayedRectZones.filter(z => z.type === 'regular');
 
                             return regularZones.map((zone, index) => (
                               <div key={zone.id} className="flex items-center gap-1.5">
@@ -1377,7 +1751,7 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
                                   className="w-3 h-3 rounded border border-white/50"
                                   style={{ backgroundColor: regularZoneColors[index % regularZoneColors.length] }}
                                 />
-                                <span className="text-slate-300">{deviceMapping?.zoneLabels?.[zone.id] || zone.label || zone.id}</span>
+                                <span className="text-slate-300">{getZoneLabel(index + 1)}</span>
                               </div>
                             ));
                           })()}
@@ -1487,13 +1861,12 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
                     <div>
                       <div className="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-2">Zone Occupancy</div>
                       <div className="grid grid-cols-2 gap-2">
-                        {[1, 2, 3, 4].map((zoneNum) => {
-                          const zoneKey = `zone${zoneNum}` as 'zone1' | 'zone2' | 'zone3' | 'zone4';
-                          const isOccupied = liveState?.zoneOccupancy?.[zoneKey] ?? false;
-                          const regularZoneColors = ['#3b82f6', '#8b5cf6', '#ec4899', '#f59e0b'];
-                          // Find the matching zone to get its label
-                          const matchingZone = selectedRoom?.zones?.find(z => z.id === `Zone ${zoneNum}` || z.id === `zone${zoneNum}` || z.id === `zone_${zoneNum}`);
-                          const zoneLabel = (matchingZone && deviceMapping?.zoneLabels?.[matchingZone.id]) || matchingZone?.label || `Zone ${zoneNum}`;
+                        {zoneOccupancyNumbers.map((zoneNum) => {
+                          const zoneKey = `zone${zoneNum}`;
+                          const zoneOccupancy = liveState?.zoneOccupancy as Record<string, boolean | undefined> | undefined;
+                          const isOccupied = zoneOccupancy?.[zoneKey] ?? false;
+                          const regularZoneColors = ['#3b82f6', '#8b5cf6', '#ec4899', '#f59e0b', '#06b6d4'];
+                          const zoneLabel = getZoneLabel(zoneNum);
 
                           return (
                             <div
@@ -1687,12 +2060,14 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
             {heatmapEnabled && heatmapData?.hourlyBreakdown && (
               <HourlyActivityChart data={heatmapData.hourlyBreakdown} visible={heatmapEnabled} />
             )}
+              </div>
+            </div>
           </div>
 
 
           {/* Settings Panel (appears when toggled) */}
           {showSettings && (
-            <div className="absolute bottom-6 right-6 z-50 w-64">
+            <div className="absolute bottom-40 right-6 z-50 hidden w-64 md:block">
               <div className="rounded-xl border border-slate-700/50 bg-slate-900/95 backdrop-blur p-4 shadow-xl">
                 <div className="text-sm font-semibold text-slate-100 mb-3">Display Settings</div>
                 <div className="space-y-2.5">
@@ -1737,11 +2112,11 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
                       onChange={(e) => setShowDeviceRadar(e.target.checked)}
                       className="w-4 h-4 rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500 focus:ring-offset-0"
                     />
-                    <span className="flex items-center gap-1.5">
-                      <span className="w-3 h-3 rounded-full bg-emerald-500"></span>
-                      Device Max ({String(selectedProfile?.limits?.maxRangeMeters ?? 25)}m)
-                    </span>
-                  </label>
+                      <span className="flex items-center gap-1.5">
+                        <span className="w-3 h-3 rounded-full bg-emerald-500"></span>
+                      Device Max ({String(effectiveCoverageMaxRangeMeters ?? 25)}m)
+                      </span>
+                    </label>
 
                   {/* Aligned direction - EPL only */}
                   {!isEP1 && (
@@ -1947,6 +2322,19 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
                     </div>
                   </div>
 
+                  <div className="mt-3 border-t border-slate-700/50 pt-3">
+                    <DisplaySettingsControls
+                      appearance={{
+                        targetMarkerScale,
+                        setTargetMarkerScale,
+                        showZoneLabels,
+                        setShowZoneLabels,
+                        zoneLabelScale,
+                        setZoneLabelScale,
+                      }}
+                    />
+                  </div>
+
                   {/* Theme Switcher */}
                   <div className="mt-3 pt-3 border-t border-slate-700/50">
                     <ThemeSwitcher />
@@ -1958,7 +2346,7 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
 
           {/* EP1 Recommendations Popup */}
           {showRecommendations && isEP1 && selectedRoom && liveState && (
-            <div className="absolute bottom-6 right-6 z-50 w-80">
+            <div className="absolute bottom-40 right-6 z-50 hidden w-80 md:block">
               <div className="rounded-xl border border-slate-700/50 bg-slate-900/95 backdrop-blur p-4 shadow-xl">
                 <div className="flex items-center justify-between mb-3">
                   <div className="text-sm font-semibold text-slate-100">💡 Settings Recommendations</div>
@@ -2072,8 +2460,8 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
             </div>
           )}
 
-          {/* Floating Controls (bottom left, above snap) */}
-          <div className={`absolute ${isEP1 ? 'bottom-32' : 'bottom-56'} left-6 z-40 flex flex-col gap-2 rounded-xl border border-slate-700/50 bg-slate-900/90 backdrop-blur px-3 py-3 shadow-xl`}>
+          {/* Floating Controls (bottom right) */}
+          <div className="absolute bottom-6 right-6 z-40 hidden flex-col gap-2 rounded-xl border border-slate-700/50 bg-slate-900/90 backdrop-blur px-3 py-3 shadow-xl md:flex">
             <div className="flex flex-wrap gap-1.5">
               <button
                 className="rounded-lg border border-slate-700/50 bg-slate-800/50 px-3 py-1.5 text-xs font-semibold text-slate-100 transition-all hover:border-slate-600 hover:bg-slate-700 active:scale-95"
@@ -2114,7 +2502,10 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
                     ? 'border-slate-500 bg-slate-600/90 text-slate-100'
                     : 'border-slate-700/50 bg-slate-800/50 text-slate-100 hover:border-slate-600 hover:bg-slate-700'
                 }`}
-                onClick={() => setShowSettings((v) => !v)}
+                onClick={() => {
+                  setShowRecommendations(false);
+                  setShowSettings((v) => !v);
+                }}
                 title="Display Settings"
               >
                 🎨 Display
@@ -2135,7 +2526,10 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
                       ? 'border-emerald-500 bg-emerald-600/20 text-emerald-100'
                       : 'border-slate-700/50 bg-slate-800/50 text-slate-100 hover:border-slate-600 hover:bg-slate-700'
                   }`}
-                  onClick={() => setShowRecommendations((v) => !v)}
+                  onClick={() => {
+                    setShowSettings(false);
+                    setShowRecommendations((v) => !v);
+                  }}
                   title="Settings Recommendations"
                 >
                   💡 Tips
@@ -2146,7 +2540,7 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
 
           {/* Recording Controls (bottom left, above snap) - EPL only */}
           {!isEP1 && (
-            <div className="absolute bottom-32 left-6 z-40 rounded-xl border border-slate-700/50 bg-slate-900/90 backdrop-blur px-4 py-3 shadow-xl">
+            <div className="absolute bottom-32 left-6 z-40 hidden rounded-xl border border-slate-700/50 bg-slate-900/90 backdrop-blur px-4 py-3 shadow-xl md:block">
               <div className="flex items-center gap-3">
                 <button
                   onClick={() => {
@@ -2186,7 +2580,7 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
           )}
 
           {/* Floating Snap Controls (bottom left) */}
-          <div className="absolute bottom-6 left-6 z-40 flex flex-col gap-2 rounded-xl border border-slate-700/50 bg-slate-900/90 backdrop-blur px-4 py-3 shadow-xl">
+          <div className="absolute bottom-6 left-6 z-40 hidden flex-col gap-2 rounded-xl border border-slate-700/50 bg-slate-900/90 backdrop-blur px-4 py-3 shadow-xl md:flex">
             <span className="text-xs text-slate-400 font-medium">Snap Grid</span>
             <div className="flex flex-wrap gap-2">
               {[0, 50, 100, 200].map((v) => (
@@ -2208,8 +2602,306 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
               {cursorPos ? (cursorPos.y / 1000).toFixed(2) : '--'}m
             </div>
           </div>
+
+          <div className="md:hidden">
+            <CanvasBottomToolbar>
+              <CanvasToolbarButton
+                label="Details"
+                active={activeMobileSheet === 'details'}
+                onClick={() => setActiveMobileSheet(activeMobileSheet === 'details' ? null : 'details')}
+              />
+              <CanvasToolbarButton
+                label="Display"
+                active={activeMobileSheet === 'display'}
+                onClick={() => setActiveMobileSheet(activeMobileSheet === 'display' ? null : 'display')}
+              />
+              <CanvasToolbarButton
+                label="Zoom"
+                active={activeMobileSheet === 'zoom'}
+                onClick={() => setActiveMobileSheet(activeMobileSheet === 'zoom' ? null : 'zoom')}
+              />
+              {!isEP1 && (
+                <CanvasToolbarButton
+                  label={isRecording ? 'Stop' : 'Record'}
+                  active={isRecording}
+                  badge={recordedTrail.length > 0 ? recordedTrail.length : undefined}
+                  onClick={() => {
+                    if (isRecording) {
+                      setIsRecording(false);
+                    } else {
+                      setRecordedTrail([]);
+                      setIsRecording(true);
+                    }
+                  }}
+                />
+              )}
+              <CanvasToolbarButton
+                label="Device"
+                onClick={() => setShowDeviceSettings(true)}
+              />
+            </CanvasBottomToolbar>
+          </div>
         </div>
       )}
+
+      <CanvasMobileSheet
+        open={activeMobileSheet === 'navigation'}
+        title="Menu"
+        onClose={() => setActiveMobileSheet(null)}
+      >
+        <div className="space-y-2">
+          {onNavigate && (
+            <>
+              <button
+                type="button"
+                onClick={() => {
+                  onNavigate('wizard');
+                  setActiveMobileSheet(null);
+                }}
+                className="w-full rounded-lg border border-slate-700 bg-slate-800 px-4 py-3 text-left text-sm font-semibold text-slate-100"
+              >
+                Add Device
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  if (!isEP1) {
+                    onNavigate('zoneEditor');
+                    setActiveMobileSheet(null);
+                  }
+                }}
+                disabled={isEP1}
+                className="w-full rounded-lg border border-slate-700 bg-slate-800 px-4 py-3 text-left text-sm font-semibold text-slate-100 disabled:opacity-40"
+              >
+                Zone Editor
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  onNavigate('roomBuilder');
+                  setActiveMobileSheet(null);
+                }}
+                className="w-full rounded-lg border border-slate-700 bg-slate-800 px-4 py-3 text-left text-sm font-semibold text-slate-100"
+              >
+                Room Builder
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  onNavigate('settings');
+                  setActiveMobileSheet(null);
+                }}
+                className="w-full rounded-lg border border-slate-700 bg-slate-800 px-4 py-3 text-left text-sm font-semibold text-slate-100"
+              >
+                Settings
+              </button>
+            </>
+          )}
+        </div>
+      </CanvasMobileSheet>
+
+      <CanvasMobileSheet
+        open={activeMobileSheet === 'details'}
+        title="Details"
+        description={selectedRoom?.name ? `${isEP1 ? 'EP1 Status' : 'Live Tracking'} - ${selectedRoom.name}` : (isEP1 ? 'EP1 Status' : 'Live Tracking')}
+        onClose={() => setActiveMobileSheet(null)}
+      >
+        <div className="space-y-4 text-sm text-slate-200">
+          <div className="rounded-xl border border-slate-700/60 bg-slate-800/50 p-3">
+            <div className="mb-2 flex items-center gap-2">
+              <div className={`h-3 w-3 rounded-full ${
+                presenceAvailability === 'unavailable'
+                  ? 'bg-amber-500'
+                  : liveState?.presence
+                  ? 'bg-emerald-500'
+                  : 'bg-slate-600'
+              }`} />
+              <span className="font-semibold text-white">Current State</span>
+            </div>
+            <div className="space-y-2 text-xs">
+              <div className="flex justify-between border-b border-slate-700/50 py-1">
+                <span className="text-slate-400">Presence</span>
+                <span className={presenceClass}>{presenceLabel}</span>
+              </div>
+              {!isEP1 && (
+                <div className="flex justify-between border-b border-slate-700/50 py-1">
+                  <span className="text-slate-400">Targets</span>
+                  <span className="text-aqua-400">{displayTargetPositions.length}</span>
+                </div>
+              )}
+              {liveState?.distance !== null && liveState?.distance !== undefined && (
+                <div className="flex justify-between border-b border-slate-700/50 py-1">
+                  <span className="text-slate-400">Distance</span>
+                  <span className="text-aqua-400">{liveState.distance.toFixed(2)}m</span>
+                </div>
+              )}
+              {isEP1 && (
+                <>
+                  <div className="flex justify-between border-b border-slate-700/50 py-1">
+                    <span className="text-slate-400">mmWave</span>
+                    <span className={mmwaveClass}>{mmwaveLabel}</span>
+                  </div>
+                  <div className="flex justify-between border-b border-slate-700/50 py-1">
+                    <span className="text-slate-400">PIR</span>
+                    <span className={pirClass}>{pirLabel}</span>
+                  </div>
+                </>
+              )}
+              {liveState?.temperature !== null && liveState?.temperature !== undefined && (
+                <div className="flex justify-between border-b border-slate-700/50 py-1">
+                  <span className="text-slate-400">Temperature</span>
+                  <span>{liveState.temperature.toFixed(1)}{deviceMapping?.entityUnits?.temperature || '°C'}</span>
+                </div>
+              )}
+              {liveState?.co2 !== null && liveState?.co2 !== undefined && (
+                <div className="flex justify-between border-b border-slate-700/50 py-1">
+                  <span className="text-slate-400">CO2</span>
+                  <span>{Math.round(liveState.co2)} {deviceMapping?.entityUnits?.co2 || 'ppm'}</span>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {!isEP1 && liveState && (
+            <div className="rounded-xl border border-slate-700/60 bg-slate-800/50 p-3">
+              <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">Zone Occupancy</div>
+              <div className="grid grid-cols-2 gap-2">
+                {zoneOccupancyNumbers.map((zoneNum) => {
+                  const zoneKey = `zone${zoneNum}`;
+                  const zoneOccupancy = liveState.zoneOccupancy as Record<string, boolean | undefined> | undefined;
+                  const isOccupied = zoneOccupancy?.[zoneKey] ?? false;
+                  return (
+                    <div
+                      key={zoneNum}
+                      className={`rounded-lg border px-2 py-2 text-xs ${
+                        isOccupied
+                          ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
+                          : 'border-slate-700 bg-slate-900/40 text-slate-500'
+                      }`}
+                    >
+                      <div className="truncate font-semibold">{getZoneLabel(zoneNum)}</div>
+                      <div className="mt-0.5 text-[10px]">{isOccupied ? 'Occupied' : 'Clear'}</div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {!isEP1 && liveState?.targets && (
+            <div className="rounded-xl border border-slate-700/60 bg-slate-800/50 p-3">
+              <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">Targets</div>
+              <div className="space-y-2">
+                {[1, 2, 3].map((targetId) => {
+                  const target = liveState.targets?.find((candidate) => candidate.id === targetId);
+                  const isActive = target?.active || (target?.x !== null && target?.x !== undefined && target.x !== 0);
+                  return (
+                    <div key={targetId} className="rounded-lg bg-slate-900/50 px-3 py-2 text-xs">
+                      <div className="flex items-center justify-between">
+                        <span className={isActive ? 'font-semibold text-slate-100' : 'text-slate-500'}>Target {targetId}</span>
+                        <span className={isActive ? 'text-emerald-400' : 'text-slate-600'}>{isActive ? 'Active' : 'Inactive'}</span>
+                      </div>
+                      {isActive && target && (
+                        <div className="mt-1 grid grid-cols-2 gap-x-3 gap-y-1 text-[10px] text-slate-400">
+                          <span>X: {target.x?.toFixed(0) ?? '--'} mm</span>
+                          <span>Y: {target.y?.toFixed(0) ?? '--'} mm</span>
+                          {target.distance !== null && target.distance !== undefined && <span>Dist: {target.distance.toFixed(0)} mm</span>}
+                          {target.speed !== null && target.speed !== undefined && <span>Speed: {target.speed.toFixed(2)} m/s</span>}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </div>
+      </CanvasMobileSheet>
+
+      <CanvasMobileSheet
+        open={activeMobileSheet === 'display'}
+        title="Display"
+        onClose={() => setActiveMobileSheet(null)}
+      >
+        <DisplaySettingsControls
+          overlayOptions={[
+            { label: 'Max distance', checked: showMaxDistanceOverlay, onChange: setShowMaxDistanceOverlay },
+            ...(isEP1 ? [{ label: 'Trigger distance', checked: showTriggerDistanceOverlay, onChange: setShowTriggerDistanceOverlay }] : []),
+            { label: 'Device coverage', checked: showDeviceRadar, onChange: setShowDeviceRadar },
+            ...(!isEP1 ? [{ label: 'Aligned direction', checked: showAlignedDirection, onChange: setShowAlignedDirection }] : []),
+            ...(!isEP1 ? [{ label: 'Movement trails', checked: showTrails, onChange: setShowTrails }] : []),
+            ...(!isEP1 ? [{ label: 'Smooth tracking', checked: smoothTracking, onChange: setSmoothTracking }] : []),
+            { label: 'Clip radar to walls', checked: clipRadarToWalls, onChange: setClipRadarToWalls },
+          ]}
+          roomOptions={[
+            { label: 'Walls', checked: showWalls, onChange: setShowWalls },
+            { label: 'Furniture', checked: showFurniture, onChange: setShowFurniture },
+            { label: 'Doors', checked: showDoors, onChange: setShowDoors },
+            ...(!isEP1 ? [{ label: 'Zones', checked: showZones, onChange: setShowZones }] : []),
+            { label: 'Device icon', checked: showDeviceIcon, onChange: setShowDeviceIcon },
+            { label: 'Targets', checked: showTargets, onChange: setShowTargets },
+          ]}
+          appearance={{
+            targetMarkerScale,
+            setTargetMarkerScale,
+            showZoneLabels,
+            setShowZoneLabels,
+            zoneLabelScale,
+            setZoneLabelScale,
+          }}
+          extraSections={supportsHeatmap && !isEP1 ? (
+            <div className="space-y-2">
+              <div className="text-xs font-semibold uppercase tracking-wide text-slate-400">Heatmap</div>
+              <label className="flex min-h-[40px] cursor-pointer items-center justify-between gap-3 rounded-lg border border-slate-700 bg-slate-800/50 px-3 text-sm text-slate-200">
+                <span className="font-medium">Show heatmap</span>
+                <input
+                  type="checkbox"
+                  checked={heatmapEnabled}
+                  onChange={(event) => setHeatmapEnabled(event.target.checked)}
+                  className="h-4 w-4 rounded border-slate-600 bg-slate-800 text-aqua-500 focus:ring-aqua-500 focus:ring-offset-0"
+                />
+              </label>
+            </div>
+          ) : undefined}
+          footer={<ThemeSwitcher />}
+        />
+      </CanvasMobileSheet>
+
+      <CanvasMobileSheet
+        open={activeMobileSheet === 'zoom'}
+        title="Zoom & Snap"
+        onClose={() => setActiveMobileSheet(null)}
+      >
+        <div className="space-y-4 text-sm text-slate-200">
+          <div className="grid grid-cols-2 gap-2">
+            <button className="rounded-lg border border-slate-700 bg-slate-800 px-4 py-3 font-semibold" onClick={() => setZoom((value) => Math.min(5, value + 0.1))}>Zoom In</button>
+            <button className="rounded-lg border border-slate-700 bg-slate-800 px-4 py-3 font-semibold" onClick={() => setZoom((value) => Math.max(0.1, value - 0.1))}>Zoom Out</button>
+            <button className="rounded-lg border border-slate-700 bg-slate-800 px-4 py-3 font-semibold" onClick={() => { setZoom(1.1); setPanOffsetMm({ x: 0, y: 0 }); }}>Reset</button>
+            <button className="rounded-lg border border-aqua-600/60 bg-aqua-600/20 px-4 py-3 font-semibold text-aqua-100" onClick={handleAutoZoom}>Auto Fit</button>
+          </div>
+          <div>
+            <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">Snap Grid</div>
+            <div className="grid grid-cols-4 gap-2">
+              {[0, 50, 100, 200].map((value) => (
+                <button
+                  key={value}
+                  onClick={() => setSnapGridMm(value)}
+                  className={`rounded-lg border px-2 py-2 text-xs font-semibold ${
+                    snapGridMm === value
+                      ? 'border-aqua-500 bg-aqua-500/20 text-aqua-100'
+                      : 'border-slate-700 bg-slate-800 text-slate-200'
+                  }`}
+                >
+                  {value === 0 ? 'Off' : `${value}mm`}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="rounded-lg border border-slate-700 bg-slate-800/50 px-3 py-2 text-xs text-slate-400">
+            Cursor: X {cursorPos ? (cursorPos.x / 1000).toFixed(2) : '--'}m, Y {cursorPos ? (cursorPos.y / 1000).toFixed(2) : '--'}m
+          </div>
+        </div>
+      </CanvasMobileSheet>
 
       {/* Device Settings Modal */}
       {selectedRoom && (
@@ -2218,7 +2910,7 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
           onClose={() => setShowDeviceSettings(false)}
           room={selectedRoom}
           liveState={liveState ?? null}
-          isEP1={isEP1}
+          deviceTypeLabel={selectedProfile?.label ?? selectedRoom.profileId ?? 'Device'}
         />
       )}
     </div>

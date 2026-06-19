@@ -98,6 +98,46 @@ function App() {
     [profiles, selectedProfileId]
   );
 
+  const refreshLiveState = React.useCallback(async () => {
+    if (!selectedRoom || !selectedRoom.deviceId || !selectedProfile) {
+      setLiveState(null);
+      return;
+    }
+
+    const mappingsParam = selectedRoom.entityMappings
+      ? `&entityMappings=${encodeURIComponent(JSON.stringify(selectedRoom.entityMappings))}`
+      : '';
+    const restUrl = ingressAware(
+      `api/live/${selectedRoom.deviceId}/state?profileId=${selectedProfile.id}${mappingsParam}`
+    );
+
+    try {
+      const res = await fetch(restUrl);
+      if (!res.ok) {
+        throw new Error('Failed to refresh live state');
+      }
+      const data = await res.json() as { state?: LiveState };
+      setLiveState(data.state ?? null);
+    } catch {
+      // Keep the current live state if the refresh fails.
+    }
+  }, [selectedProfile, selectedRoom]);
+
+  useEffect(() => {
+    const handleRefresh = (event: Event) => {
+      const detail = (event as CustomEvent<{ deviceId?: string }>).detail;
+      if (detail?.deviceId && detail.deviceId !== selectedRoom?.deviceId) {
+        return;
+      }
+      void refreshLiveState();
+    };
+
+    window.addEventListener('ep:refresh-live-state', handleRefresh as EventListener);
+    return () => {
+      window.removeEventListener('ep:refresh-live-state', handleRefresh as EventListener);
+    };
+  }, [refreshLiveState, selectedRoom?.deviceId]);
+
   // WebSocket connection for real-time state updates (global)
   useEffect(() => {
     if (!selectedRoom || !selectedRoom.deviceId || !selectedProfile) {
@@ -129,7 +169,6 @@ function App() {
               type: 'subscribe',
               deviceId: selectedRoom.deviceId,
               profileId: selectedProfile.id,
-              entityNamePrefix: selectedRoom.entityNamePrefix,
               entityMappings: selectedRoom.entityMappings,
             }),
           );
@@ -139,7 +178,7 @@ function App() {
           try {
             const message = JSON.parse(event.data);
 
-            if (message.type === 'warning' && message.code === 'MAPPING_NOT_FOUND') {
+            if ((message.type === 'warning' || message.type === 'error') && message.code === 'MAPPING_NOT_FOUND') {
               // Device has no entity mappings - user should run entity discovery
               console.warn('MAPPING_NOT_FOUND:', message.message);
               // Set error to prompt user to configure entity mappings
@@ -149,14 +188,7 @@ function App() {
               if (message.hasMappings === false) {
                 console.warn('Device subscribed but no mappings available');
               }
-              // Fetch initial state via REST as fallback
-              const entityParam = selectedRoom.entityNamePrefix ? `&entityNamePrefix=${selectedRoom.entityNamePrefix}` : '';
-              const mappingsParam = selectedRoom.entityMappings ? `&entityMappings=${encodeURIComponent(JSON.stringify(selectedRoom.entityMappings))}` : '';
-              const restUrl = ingressAware(`api/live/${selectedRoom.deviceId}/state?profileId=${selectedProfile.id}${entityParam}${mappingsParam}`);
-              fetch(restUrl)
-                .then((res) => res.json())
-                .then((data) => setLiveState(data.state))
-                .catch(() => null);
+              void refreshLiveState();
             } else if (message.type === 'state_update') {
               // Update live state with new entity value
               setLiveState((prev) => {
@@ -181,6 +213,7 @@ function App() {
                   const value = parseInt(message.state, 10);
                   return Number.isFinite(value) ? value : null;
                 };
+                const entityKey = typeof message.entityKey === 'string' ? message.entityKey : '';
 
                 // Helper to check if entity matches a mapping or falls back to pattern
                 const mappings = selectedRoom.entityMappings;
@@ -197,16 +230,16 @@ function App() {
 
                 // Helper to check zone occupancy entities from mappings
                 const checkZoneOccupancy = (): { matched: boolean; zoneNum?: number } => {
-                  // Check mapped zone occupancy entities first
-                  if (mappings?.trackingTargets) {
-                    // Zone occupancy entities aren't in trackingTargets, check settingsEntities or dedicated zone mappings
-                  }
-                  // For now, check each zone individually - these would be in a zoneOccupancyEntities mapping
-                  // Fall back to pattern matching for legacy rooms
-                  if (!mappings) {
-                    const match = message.entityId.match(/zone_(\d+)_(occupancy|presence)/);
-                    if (match) {
-                      return { matched: true, zoneNum: parseInt(match[1], 10) };
+                  const entityKey = typeof message.entityKey === 'string' ? message.entityKey : '';
+                  for (let zoneNum = 1; zoneNum <= (selectedProfile.limits.maxZones ?? 4); zoneNum += 1) {
+                    const mappingKey = `zone${zoneNum}Occupancy`;
+                    if (entityKey === mappingKey) {
+                      return { matched: true, zoneNum };
+                    }
+
+                    const mappedEntity = (mappings as Record<string, unknown> | undefined)?.[mappingKey];
+                    if (typeof mappedEntity === 'string' && message.entityId === mappedEntity) {
+                      return { matched: true, zoneNum };
                     }
                   }
                   return { matched: false };
@@ -301,10 +334,14 @@ function App() {
                   if (!updated.config) updated.config = {} as any;
                   setAvailability('distanceMax');
                   updated.config!.distanceMax = parseNumberValue();
-                } else if (matchesEntity(mappings?.installationAngleEntity, 'installation_angle', 'tracking_sensor_angle')) {
+                } else if (entityKey === 'installationAngleEntity' || matchesEntity(mappings?.installationAngleEntity, 'installation_angle', 'tracking_sensor_angle')) {
                   if (!updated.config) updated.config = {} as any;
                   setAvailability('installationAngle');
                   updated.config!.installationAngle = parseNumberValue() ?? undefined;
+                } else if (entityKey === 'upsideDownMountingEntity' || matchesEntity(mappings?.upsideDownMountingEntity, 'upside_down_mounting')) {
+                  if (!updated.config) updated.config = {} as any;
+                  setAvailability('upsideDownMounting');
+                  updated.config!.upsideDownMounting = message.state === 'on';
                 }
                 // Settings entities that may not have dedicated mappings yet - use settingsEntities
                 else if (matchesEntity(mappings?.settingsEntities?.mmwaveDistanceMin, 'distance_min', 'mmwave_minimum_distance')) {
@@ -409,10 +446,10 @@ function App() {
                     }
                   }
                   // Handle assumed presence status (entry/exit feature)
-                  else if (matchesEntity(mappings?.assumedPresentRemainingEntity, 'assumed_present_remaining')) {
+                  else if (entityKey === 'assumedPresentRemaining' || matchesEntity(mappings?.assumedPresentRemainingEntity, 'assumed_present_remaining')) {
                     const value = parseFloat(message.state);
                     updated.assumedPresentRemaining = !isNaN(value) ? value : undefined;
-                  } else if (matchesEntity(mappings?.assumedPresentEntity, 'assumed_present')) {
+                  } else if (entityKey === 'assumedPresent' || matchesEntity(mappings?.assumedPresentEntity, 'assumed_present')) {
                     updated.assumedPresent = message.state === 'on';
                   }
                 }
@@ -461,11 +498,12 @@ function App() {
       }
     };
     // Depend on memoized room/profile objects - only changes when the actual objects change
-  }, [selectedRoom, selectedProfile]);
+  }, [refreshLiveState, selectedRoom, selectedProfile]);
 
   // Transform device-relative coordinates to room coordinates
   const installationAngle =
     typeof liveState?.config?.installationAngle === 'number' ? liveState.config.installationAngle : 0;
+  const upsideDownMounting = liveState?.config?.upsideDownMounting === true;
 
   const deviceToRoom = React.useCallback((deviceX: number, deviceY: number) => {
     if (!selectedRoom?.devicePlacement) {
@@ -477,27 +515,26 @@ function App() {
     const angleRad = (effectiveRotationDeg * Math.PI) / 180;
     const cos = Math.cos(angleRad);
     const sin = Math.sin(angleRad);
+    const localX = upsideDownMounting ? -deviceX : deviceX;
 
-    const rotatedX = deviceX * cos - deviceY * sin;
-    const rotatedY = deviceX * sin + deviceY * cos;
+    const rotatedX = localX * cos - deviceY * sin;
+    const rotatedY = localX * sin + deviceY * cos;
 
     return {
       x: rotatedX + x,
       y: rotatedY + y,
     };
-  }, [selectedRoom, installationAngle]);
+  }, [selectedRoom, installationAngle, upsideDownMounting]);
 
   // Compute target positions in room coordinates
   const targetPositions = useMemo(() => {
     if (!liveState?.targets) return [];
     return liveState.targets
       .filter((t) => {
-        // Skip if explicitly marked as inactive
-        if (t.active === false) return false;
         // Skip if coordinates are null
         if (t.x === null || t.y === null) return false;
-        // Skip if coordinates are (0,0) UNLESS explicitly marked as active
-        // (0,0 usually means no detection, but if active=true, show it anyway)
+        // Treat live coordinates as the source of truth. Some devices can report
+        // stale target_N_active values while x/y continue updating correctly.
         if (t.x === 0 && t.y === 0 && t.active !== true) return false;
         return true;
       })

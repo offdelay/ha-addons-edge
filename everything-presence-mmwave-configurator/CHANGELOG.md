@@ -1,3 +1,99 @@
+## 2.2.4
+* Reduce startup load from device discovery by @EverythingSmartHome in https://github.com/EverythingSmartHome/everything-presence-addons/pull/363
+* Fix polygon zone editing failing after polygon only firmware updates by @EverythingSmartHome in https://github.com/EverythingSmartHome/everything-presence-addons/pull/364
+* Fix zone editor not working when room prefix is missing by @EverythingSmartHome in https://github.com/EverythingSmartHome/everything-presence-addons/pull/369
+
+## 2.2.3
+* Fix: Reduce broad Home Assistant entity discovery devices by @EverythingSmartHome in https://github.com/EverythingSmartHome/everything-presence-addons/pull/351
+* Fix: Handle EPL 1.5.0 polygon migration more cleanly by @EverythingSmartHome in https://github.com/EverythingSmartHome/everything-presence-addons/pull/357
+* Fix: Use HA entity registry as the primary source for device discovery by @EverythingSmartHome in https://github.com/EverythingSmartHome/everything-presence-addons/pull/358
+
+## 2.2.2
+* Improve websocket connections by @EverythingSmartHome in https://github.com/EverythingSmartHome/everything-presence-addons/pull/345
+* Fix assumed presence display status by @EverythingSmartHome in https://github.com/EverythingSmartHome/everything-presence-addons/pull/346
+* Fix labeling of EP Pro as EPL by @EverythingSmartHome in https://github.com/EverythingSmartHome/everything-presence-addons/pull/347
+* Add EP Pro settings by @EverythingSmartHome in https://github.com/EverythingSmartHome/everything-presence-addons/pull/348
+
+## 2.2.1
+* Fix issue with room builder not loading by @EverythingSmartHome in #343
+
+## 2.2.0
+
+### What's Changed
+* Update all user facing docs to use apps termionology by @timmo001 in #308
+* Make Dockerfile build layer atomic to fix #306 by @EverythingSmartHome in #311
+* Preserve zone timeouts when saving zones by @EverythingSmartHome in #312
+* Avoid save button overlap in room builder by @EverythingSmartHome in #313
+* Use native arm64 runners and build all arches on PR by @EverythingSmartHome in #315
+* Fix door swing direction rendering by @EverythingSmartHome in #316
+* Constrain live dashboard widget rail by @EverythingSmartHome in #317
+* Fix room builder wall editor bubble by @EverythingSmartHome in #319
+* Render custom furniture visuals by @EverythingSmartHome in #320
+* Clamp room builder handle size by @EverythingSmartHome in #322
+* Show configurator app version by @EverythingSmartHome in #323
+* Clarify wall splitting in room builder by @EverythingSmartHome in #324
+* Show imperial snap labels by @EverythingSmartHome in #326
+* Format imperial wall lengths by @EverythingSmartHome in #327
+* Handle upside-down EPL tracking by @EverythingSmartHome in #328
+* Lazy subscribe to HA live state by @EverythingSmartHome in #329
+* Publish major Docker tags by @EverythingSmartHome in #331
+* Fix mobile details temperature unit fallback by @EverythingSmartHome in #332
+* Align EPL assumed presence timeout range by @EverythingSmartHome in #333
+* Respect selected wall delete context by @EverythingSmartHome in #335
+* Use migration metadata for auto-prepare by @EverythingSmartHome in #337
+* Handle polygon-only EPL after migration by @EverythingSmartHome in #338
+* Back up polygon zones by @EverythingSmartHome in #340
+* Bump version by @EverythingSmartHome in #339
+
+## 2.1.0
+
+### Ceiling Mount for EP Pro
+A much requested feature for EP Pro was ceiling mount support. This would allow you to see a more accurate representation of field of view coverage in a room, and allow for drawing zones. The latter is a tricky one, since by rotating the sensor to aim at the floor, you lose the Y-axis, thus some of the tracking capabilities. 
+
+If you go over to Room Builder > Settings > Device - you can now change the mount type to ceiling and set the installation height.
+
+This will change the device icon to the ceiling mount, which can be used for orientating the device to get the best field of view for your room.
+
+In this mode, zones will work in "Slices" where we can detect a target left and right of the sensor in a "slice" but not accurately say whether it's above or down because there is 2 axis only.
+
+Zones will be automatically bound to the full width of the FoV since we can only detect in slices, but can be re-arranged, made narrower or wider.
+
+### Mobile Redesign
+A lot of feedback was around the zone configurator being unusable on mobile - and I totally agree, it was bad!
+
+This release greatly improves the mobile layout and makes it easier to drag the canvas around, pinch to zoom, proper touch targets for resizing zones and making elements not covering other elements or the canvas.
+
+It's not perfect yet but it's a huge improvement and more is coming!
+
+### More UI
+Many asked for resizable UI elements to improve drawing zones like changing the icon size of targets, font size, turning zone labels off - those are in the display settings now.
+
+The settings page was also re-designed to keep things more clean and organised - was getting pretty cluttered and unusable on mobile.
+
+Consistency of display options between pages was also lacking - fixed!
+
+### What's Changed
+* Improved Add-on Store Presentation, Instructions, and Docker Compose Experience! by @TheZackCodec in https://github.com/EverythingSmartHome/everything-presence-addons/pull/268
+* Support HA_LONG_LIVED_TOKEN_FILE for standalone auth by @poulti in https://github.com/EverythingSmartHome/everything-presence-addons/pull/267
+* Allow self-signed certificates by @jamesonuk in https://github.com/EverythingSmartHome/everything-presence-addons/pull/277
+* Add ceiling mount placement and coverage overlays by @EverythingSmartHome in https://github.com/EverythingSmartHome/everything-presence-addons/pull/285
+* fix stale installation angle synchronization after applying rotation suggestion by @EverythingSmartHome in https://github.com/EverythingSmartHome/everything-presence-addons/pull/286
+* Fix stale room zone loading on dashboard room switch by @EverythingSmartHome in https://github.com/EverythingSmartHome/everything-presence-addons/pull/287
+* Add ceiling zone editing for EP Pro by @EverythingSmartHome in https://github.com/EverythingSmartHome/everything-presence-addons/pull/290
+* Add responsive canvas layout basics by @EverythingSmartHome in https://github.com/EverythingSmartHome/everything-presence-addons/pull/291
+* Add mobile layout for live dashboard by @EverythingSmartHome in https://github.com/EverythingSmartHome/everything-presence-addons/pull/292
+* Add mobile layout for zone editor by @EverythingSmartHome in https://github.com/EverythingSmartHome/everything-presence-addons/pull/293
+* Add mobile layout for room builder by @EverythingSmartHome in https://github.com/EverythingSmartHome/everything-presence-addons/pull/294
+* Improve mobile canvas touch interactions by @EverythingSmartHome in https://github.com/EverythingSmartHome/everything-presence-addons/pull/295
+* Improve mobile wizard layout by @EverythingSmartHome in https://github.com/EverythingSmartHome/everything-presence-addons/pull/296
+* Polish mobile canvas controls by @EverythingSmartHome in https://github.com/EverythingSmartHome/everything-presence-addons/pull/297
+* Improve settings mobile layout by @EverythingSmartHome in https://github.com/EverythingSmartHome/everything-presence-addons/pull/298
+* Organise settings sections by @EverythingSmartHome in https://github.com/EverythingSmartHome/everything-presence-addons/pull/299
+* Standardise mobile control labels by @EverythingSmartHome in https://github.com/EverythingSmartHome/everything-presence-addons/pull/300
+* Align desktop settings panels by @EverythingSmartHome in https://github.com/EverythingSmartHome/everything-presence-addons/pull/301
+* Polish mobile canvas toolbar layout by @EverythingSmartHome in https://github.com/EverythingSmartHome/everything-presence-addons/pull/302
+* Improve consistency of display options by @EverythingSmartHome in https://github.com/EverythingSmartHome/everything-presence-addons/pull/303
+
 ## 2.0.12
 ## Features
 * Feature: Room builder - Add mid-segment wall insert and wall snap angle toggle by @EverythingSmartHome in https://github.com/EverythingSmartHome/everything-presence-addons/pull/256

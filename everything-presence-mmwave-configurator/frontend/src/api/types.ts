@@ -35,7 +35,7 @@ export type ZoneType = 'regular' | 'exclusion' | 'entry' | 'polygon' | 'polygonE
 /**
  * Control type for settings entities.
  */
-export type ControlType = 'number' | 'switch' | 'select' | 'light' | 'text';
+export type ControlType = 'number' | 'switch' | 'select' | 'light' | 'text' | 'button';
 
 /**
  * Entity definition in the device profile.
@@ -76,6 +76,12 @@ export interface DeviceProfile {
   /** Legacy entity map (for backward compatibility) */
   entityMap: Record<string, unknown>;
   iconUrl?: string;
+  iconUrlCeiling?: string;
+  coverage?: {
+    presets: Record<string, { label: string; horizontalFovDeg: number; verticalFovDeg: number; maxRangeMeters: number }>;
+    secondarySensors?: Record<string, { label: string; horizontalFovDeg: number; verticalFovDeg: number; maxRangeMeters: number }>;
+    defaultPresetId?: string;
+  };
 }
 
 export interface Point {
@@ -90,6 +96,7 @@ export interface ZoneRect {
   y: number;
   width: number;
   height: number;
+  timeout?: number;
   enabled?: boolean; // Whether this zone slot is active/configured
   label?: string; // Custom display label (e.g., "Bed", "Chair")
 }
@@ -124,7 +131,7 @@ export interface ZoneBackup {
   deviceName?: string;
   profileId: string;
   firmwareVersion?: string;
-  zones: ZoneRect[];
+  zones: Zone[];
   zoneLabels?: Record<string, string>;
   metadata?: {
     model?: string;
@@ -142,6 +149,12 @@ export interface DevicePlacement {
   x: number;
   y: number;
   rotationDeg?: number;
+  mountType?: 'wall' | 'ceiling';
+  heightMm?: number;
+  pitchDeg?: number;
+  coveragePresetId?: string;
+  horizontalFovDeg?: number;
+  verticalFovDeg?: number;
 }
 
 export interface FurnitureType {
@@ -219,6 +232,7 @@ export interface EntityMappings {
 
   maxDistanceEntity?: string;
   installationAngleEntity?: string;
+  upsideDownMountingEntity?: string;
   polygonZonesEnabledEntity?: string;
   trackingTargetCountEntity?: string;
   firmwareUpdateEntity?: string;
@@ -375,6 +389,7 @@ export interface EP1Config {
   updateRate?: string | null;
   // EPL-specific (installation angle for coordinate system rotation)
   installationAngle?: number;
+  upsideDownMounting?: boolean;
 }
 
 export interface EP1LiveData {
@@ -734,4 +749,5 @@ export interface AutoPrepareResponse {
   validation: FirmwareValidation;
   prepared: PreparedFirmwareResponse;
   newVersion: string;
+  migration?: FirmwareMigration;
 }
