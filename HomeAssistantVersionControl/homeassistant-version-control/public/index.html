@@ -56,8 +56,16 @@
             <div class="panel-header-info">
               <h2 id="leftPanelTitle" data-i18n="timeline.title">Timeline</h2>
             </div>
-            <div class="panel-header-actions" id="leftPanelActions" style="display: none;">
-              <select id="sortSelect" class="sort-select" onchange="handleSortChange(this.value)">
+            <div class="panel-header-actions" id="leftPanelActions">
+              <button id="manualCommitBtn" class="btn-subtle" onclick="triggerManualCommit()" data-i18n="timeline.backup_now" style="display: none; height: 32px; padding: 0 12px; margin-right: 8px;">
+                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right: 6px;">
+                  <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path>
+                  <polyline points="17 21 17 13 7 13 7 21"></polyline>
+                  <polyline points="7 3 7 8 15 8"></polyline>
+                </svg>
+                <span data-i18n="timeline.backup_now">Backup Now</span>
+              </button>
+              <select id="sortSelect" class="sort-select" onchange="handleSortChange(this.value)" style="display: none;">
                 <option value="default" data-i18n="sort.default">Default</option>
                 <option value="name_asc" data-i18n="sort.name_asc">Name (A-Z)</option>
                 <option value="name_desc" data-i18n="sort.name_desc">Name (Z-A)</option>
@@ -169,64 +177,72 @@
           <div class="settings-group">
             <div class="settings-group-title" data-i18n="settings.group_general">General</div>
 
-            <div id="debounceTimeOptions" style="margin-bottom: 20px;">
-              <label style="display: block; margin-bottom: 8px;">
-                <span style="color: var(--text-primary); font-size: 14px;" data-i18n="settings.debounce_time">Debounce
-                  Time</span>
+            <div class="setting-item" style="margin-bottom: 20px;">
+              <label style="display: flex; justify-content: space-between; align-items: center; cursor: pointer;">
+                <div>
+                  <span style="color: var(--text-primary); font-size: 14px;" data-i18n="settings.auto_save">Auto Save</span>
+                </div>
+                <div class="toggle-switch">
+                  <input type="checkbox" id="autoSave" style="display: none;" onchange="handleAutoSaveToggle()">
+                  <label for="autoSave" class="toggle-slider"></label>
+                </div>
               </label>
-              <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 8px;">
-                <div class="custom-number-input-wrapper" style="position: relative;">
-                  <input type="number" id="debounceTime" min="0" value="3" style="
+
+              <div id="debounceTimeOptions" style="margin-top: 12px; display: none;">
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 8px;">
+                  <div class="custom-number-input-wrapper" style="position: relative;">
+                    <input type="number" id="debounceTime" min="0" value="3" style="
+                      width: 100%;
+                      padding: 10px 32px 10px 12px;
+                      background: var(--bg-tertiary);
+                      border: 1px solid var(--border-subtle);
+                      border-radius: var(--radius-md);
+                      color: var(--text-primary);
+                      font-size: 14px;
+                      -moz-appearance: textfield;
+                      appearance: textfield;
+                    ">
+                    <div class="custom-spinners"
+                      style="position: absolute; right: 2px; top: 2px; bottom: 2px; display: flex; flex-direction: column; width: 24px;">
+                      <button class="spinner-btn spinner-up" onclick="stepInput('debounceTime', 1)"
+                        style="flex: 1; border: none; background: transparent; cursor: pointer; display: flex; align-items: center; justify-content: center; padding: 0;">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none"
+                          stroke="#9ca3af" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"
+                          style="transform: rotate(180deg);">
+                          <polyline points="6 9 12 15 18 9"></polyline>
+                        </svg>
+                      </button>
+                      <button class="spinner-btn spinner-down" onclick="stepInput('debounceTime', -1)"
+                        style="flex: 1; border: none; background: transparent; cursor: pointer; display: flex; align-items: center; justify-content: center; padding: 0;">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none"
+                          stroke="#9ca3af" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+                          <polyline points="6 9 12 15 18 9"></polyline>
+                        </svg>
+                      </button>
+                    </div>
+                  </div>
+                  <select id="debounceTimeUnit" style="
                     width: 100%;
-                    padding: 10px 32px 10px 12px;
+                    padding: 10px 12px;
                     background: var(--bg-tertiary);
                     border: 1px solid var(--border-subtle);
                     border-radius: var(--radius-md);
                     color: var(--text-primary);
                     font-size: 14px;
-                    -moz-appearance: textfield;
-                    appearance: textfield;
+                    -webkit-appearance: none;
+                    appearance: none;
                   ">
-                  <div class="custom-spinners"
-                    style="position: absolute; right: 2px; top: 2px; bottom: 2px; display: flex; flex-direction: column; width: 24px;">
-                    <button class="spinner-btn spinner-up" onclick="stepInput('debounceTime', 1)"
-                      style="flex: 1; border: none; background: transparent; cursor: pointer; display: flex; align-items: center; justify-content: center; padding: 0;">
-                      <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none"
-                        stroke="#9ca3af" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"
-                        style="transform: rotate(180deg);">
-                        <polyline points="6 9 12 15 18 9"></polyline>
-                      </svg>
-                    </button>
-                    <button class="spinner-btn spinner-down" onclick="stepInput('debounceTime', -1)"
-                      style="flex: 1; border: none; background: transparent; cursor: pointer; display: flex; align-items: center; justify-content: center; padding: 0;">
-                      <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none"
-                        stroke="#9ca3af" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
-                        <polyline points="6 9 12 15 18 9"></polyline>
-                      </svg>
-                    </button>
-                  </div>
+                    <option value="seconds" data-i18n="units.seconds">Seconds</option>
+                    <option value="minutes" data-i18n="units.minutes">Minutes</option>
+                    <option value="hours" data-i18n="units.hours">Hours</option>
+                    <option value="days" data-i18n="units.days">Days</option>
+                  </select>
                 </div>
-                <select id="debounceTimeUnit" style="
-                  width: 100%;
-                  padding: 10px 12px;
-                  background: var(--bg-tertiary);
-                  border: 1px solid var(--border-subtle);
-                  border-radius: var(--radius-md);
-                  color: var(--text-primary);
-                  font-size: 14px;
-                  -webkit-appearance: none;
-                  appearance: none;
-                ">
-                  <option value="seconds" data-i18n="units.seconds">Seconds</option>
-                  <option value="minutes" data-i18n="units.minutes">Minutes</option>
-                  <option value="hours" data-i18n="units.hours">Hours</option>
-                  <option value="days" data-i18n="units.days">Days</option>
-                </select>
+                <p style="color: var(--text-secondary); font-size: 12px; margin-top: 6px; margin-left: 2px;"
+                  data-i18n="settings.auto_save_desc">
+                  Automatically create a version when files are changed
+                </p>
               </div>
-              <p style="color: var(--text-secondary); font-size: 12px; margin-top: 6px; margin-left: 2px;"
-                data-i18n="settings.debounce_time_desc">
-                Time to wait before creating a version after file changes
-              </p>
             </div>
 
 
@@ -345,6 +361,20 @@
                   Maximum number of commits to display in the timeline (50-10000)
                 </p>
               </div>
+            </div>
+
+            <div class="setting-item" style="display: flex; justify-content: space-between; align-items: center; margin-top: 10px;">
+              <div>
+                <span style="color: var(--text-primary); font-size: 14px;" data-i18n="settings.flush_repository">Flush Repository</span>
+                <p style="color: var(--text-secondary); font-size: 12px; margin-top: 4px; margin-bottom: 0;" data-i18n="settings.flush_repository_desc">
+                  Consolidate history and reduce disk space usage
+                </p>
+              </div>
+              <button onclick="flushRepository()" id="flushBtn"
+                style="padding: 8px 16px; background: var(--bg-tertiary); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); color: var(--text-primary); font-size: 13px; cursor: pointer; transition: filter 0.15s ease; white-space: nowrap;"
+                onmouseover="this.style.filter='brightness(1.2)'" onmouseout="this.style.filter='brightness(1)'">
+                Flush
+              </button>
             </div>
 
           </div>
@@ -768,7 +798,7 @@
   </div>
 
 
-  <script src="app.js?v=1741715719"></script>
+  <script src="app.js?v=1.2.0-debug.12"></script>
 </body>
 
 </html>

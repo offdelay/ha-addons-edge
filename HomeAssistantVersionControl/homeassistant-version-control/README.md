@@ -15,6 +15,7 @@ Home Assistant Version Control provides complete version history for your setup.
 *   **Polished Interface:** Enjoy resizable panels, subtle UI animations, and improved visibility for files tracked outside the main config folder.
 *   **Confetti Mode:** Celebrate every successful restore with a realistic confetti burst (opt-in via settings).
 *   **History Control:** New setting to choose exactly how many commits to keep in your history, helping manage storage on smaller devices.
+*   **Manual Mode:** New option to disable automatic file watching and backups. Perfect for users who want full control over when versions are created.
 
 
 ![Screenshot 1](https://github.com/saihgupr/HomeAssistantVersionControl/raw/develop/images/screenshots/1.2.png)
@@ -29,6 +30,7 @@ Home Assistant Version Control provides complete version history for your setup.
 * **Smart Debouncing:** Multiple rapid edits are grouped into a single save snapshot (customizable delay).
 * **Comprehensive Tracking:** Monitors `.yaml`, `.yml`, and `lovelace` dashboard files.
 * **Custom Extensions:** Track any file format (e.g., `.sh`, `.py`, `.json`, `.conf`) by adding it to the configuration.
+* **Manual Mode:** Option to disable file watching and only trigger backups manually via the "Backup Now" button.
 * **Efficient Storage:** Uses Git deduplication to minimize disk usage.
 
 ### Cloud Backup & Sync
@@ -348,6 +350,10 @@ The app is branch-agnostic and will automatically detect the active branch of yo
 > [!TIP]
 > **Excluding Files:**
 > You can prevent specific files from being tracked by adding them to a `.gitignore` file in your `/config` directory. Just list the filenames (one per line) that you want to exclude, and the app will automatically ignore them from version control.
+
+> [!TIP]
+> **Managing Repository Size:**
+> Over time, your `.git` folder can grow large if you track binary files or frequently updated storage files. You can "flush" the repository by running `git gc --prune=now --aggressive`. If you need to surgically remove large files from your entire history to reach a target size (e.g., 1-2MB), you can use `git-filter-repo`. **Note:** After rewriting history, other clones of the repository will need a `git pull --rebase` or a fresh clone to sync.
 
 </details>
 

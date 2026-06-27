@@ -1,5 +1,31 @@
-ARG BUILD_FROM
+ARG BUILD_FROM=ghcr.io/home-assistant/base:latest
 FROM $BUILD_FROM
+
+# Build arguments
+ARG BUILD_ARCH
+ARG BUILD_VERSION
+ARG BUILD_DATE
+ARG BUILD_REF
+
+# Labels
+LABEL \
+    io.hass.name="Home Assistant Version Control" \
+    io.hass.description="Git-powered version control for Home Assistant configuration" \
+    io.hass.arch="${BUILD_ARCH}" \
+    io.hass.type="app" \
+    io.hass.version="${BUILD_VERSION}" \
+    maintainer="saihgupr" \
+    org.opencontainers.image.title="Home Assistant Version Control" \
+    org.opencontainers.image.description="Git-powered version control for Home Assistant configuration" \
+    org.opencontainers.image.vendor="Home Assistant Version Control" \
+    org.opencontainers.image.authors="saihgupr" \
+    org.opencontainers.image.licenses="MIT" \
+    org.opencontainers.image.url="https://github.com/saihgupr/HomeAssistantVersionControl" \
+    org.opencontainers.image.source="https://github.com/saihgupr/HomeAssistantVersionControl" \
+    org.opencontainers.image.documentation="https://github.com/saihgupr/HomeAssistantVersionControl/blob/main/README.md" \
+    org.opencontainers.image.created=${BUILD_DATE} \
+    org.opencontainers.image.revision=${BUILD_REF} \
+    org.opencontainers.image.version=${BUILD_VERSION}
 
 ENV LANG C.UTF-8
 

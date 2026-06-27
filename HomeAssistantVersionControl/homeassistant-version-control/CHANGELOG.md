@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.2.3]
+
+### Fixed
+- **Multi-Arch Support:** Added `build.yaml` to ensure correct base images are pulled for all supported architectures (aarch64, amd64, armhf, armv7, i386), fixing "failed to install" errors on various platforms.
+
+## [1.2.2]
+
+### Fixed
+- **Multi-Arch Support:** Switched to architecture-agnostic base image in Dockerfile to fix build failures on `aarch64` (HA Green) and newer Home Assistant Supervisor versions (2026.04.0+).
+
+## [1.2.1]
+
+### Fixed
+- UI and stability refinements.
+
 ## [1.2.0]
 
 ### Added
@@ -8,10 +23,12 @@
 - **Remote URL Configuration:** Added `remote_url` option to the addon configuration to allow easily changing the remote repository URL from the Home Assistant UI.
 - **Smart SSH Key Loader:** Persistently load SSH keys from `/config/.ssh` into the addon environment.
 - **Trusted CA Certificates:** Automatically sync and trust root CA certificates from `/config/additional_ca` for secure connections to private Git remotes.
-- **Confetti Mode:** Added a toggle to celebrate successful restores with a realistic, physics-based confetti animation.
-- **Max Commits Setting:** Added UI to configure the maximum number of commits retained in history.
+- **Confetti Mode:** Celebrate every successful restore with a realistic confetti burst (opt-in via settings).
+- **History Control:** New setting to choose exactly how many commits to keep in your history, helping manage storage on smaller devices.
+- **Manual Mode:** New option to disable automatic file watching and backups. Perfect for users who want full control over when versions are created.
 - **Resizable Panels:** The side and main panels can now be resized by dragging the gap between them.
 - **Header Palette Cycle:** Clicking the header title or logo now cycles through available accent color palettes.
+- **Manual Mode Only:** Added a new setting to disable automatic versioning and file watching. A "Backup Now" button appears in the sidebar to trigger snapshots manually.
 
 ### Fixed
 - **Dynamic File Formats:** Fixed issue where `.py`, `.json`, and `.txt` formats were hardcoded to `false` in `server.js`, ignoring the `include_extensions` configuration.
@@ -23,6 +40,9 @@
 - **Files Tab External Path Display:** External mirrored paths now render as virtual `/share/...` and `/media/...` paths, with top-level `share` and `media` folders shown directly instead of `.havc_external`.
 - **Documentation:** Fixed Docker image name typo in README.
 - **Automation Diff Line Numbers:** Corrected line number synchronization in automation and script diff views when comparing isolated YAML content. Diffs now always start at line 1, preventing offsets during history browsing and after file deletions.
+- **File Watcher Ignore Logic:** Fixed issue where excluded files (like camera snapshots) were still triggering Git operations, causing `index.lock` errors and high system load.
+- **Storage File Tracking Cleanup:** Added automatic untracking for `.storage/` files that are removed from the `include_storage` list, ensuring your Git repository accurately reflects your current settings.
+- **Watcher Optimization:** The addon now proactively "unwatches" excluded paths to reduce resource usage.
 
 ## [1.1.1]
 
@@ -33,7 +53,9 @@
 
 ### Added
 - **Cloud Backup:** Push your configuration to a private GitHub or Gitea repository. Choose to sync manually, daily, or automatically after every change.
-- **Track More than Just YAML:** Now you can select any file format to track and backup! Configure extensions like .sh, .py, .json directly in the add-on's Configuration tab.
+- **Custom Extensions:** Track any file format (e.g., `.sh`, `.py`, `.json`, `.conf`) by adding it to the configuration.
+- **Manual Mode:** Option to disable file watching and only trigger backups manually via the "Backup Now" button.
+- **Efficient Storage:** Uses Git deduplication to minimize disk usage.
 - **Recover Deleted Items:** View and restore files, automations, and scripts that have been deleted. Look for the "Deleted" option in the sort menu.
 - **Progressive History Loading:** Versions now load faster, displaying results as they're found.
 - **Quick Style Toggle:** Tap the header bar of any file diff to cycle through different visual themes instantly.

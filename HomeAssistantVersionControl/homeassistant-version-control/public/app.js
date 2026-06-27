@@ -231,14 +231,18 @@ async function loadSettings() {
         localStorage.setItem('retentionUnit', settings.retentionUnit);
 
         // Max commits
-        document.getElementById('limitHistory').checked = settings.limitHistory;
-        localStorage.setItem('limitHistory', settings.limitHistory);
         document.getElementById('maxCommits').value = settings.maxCommits;
         localStorage.setItem('maxCommits', settings.maxCommits);
+
+        // Manual mode (Internal: manualMode, UI: autoSave)
+        const manualMode = settings.manualMode === true;
+        document.getElementById('autoSave').checked = !manualMode;
+        localStorage.setItem('manualMode', manualMode);
 
         // Update UI state
         handleRetentionToggle();
         handleLimitHistoryToggle();
+        handleAutoSaveToggle();
 
       }
     }
@@ -1299,6 +1303,13 @@ function openSettings() {
 
   // Load extensions settings
   loadExtensionsSettings();
+
+  // Initialize auto save checkbox
+  const autoSaveCheckbox = document.getElementById('autoSave');
+  if (autoSaveCheckbox) {
+    autoSaveCheckbox.checked = localStorage.getItem('manualMode') !== 'true';
+    handleAutoSaveToggle();
+  }
 }
 
 function closeSettings() {
@@ -1317,6 +1328,7 @@ async function saveSettings() {
   const historyRetention = document.getElementById('historyRetention').checked;
   const limitHistory = document.getElementById('limitHistory').checked;
   const maxCommits = parseInt(document.getElementById('maxCommits').value);
+  const manualMode = !document.getElementById('autoSave').checked;
 
   const diffViewSplit = document.getElementById('diffViewSplit').checked;
   const newDiffViewFormat = diffViewSplit ? 'split' : 'unified';
@@ -1333,6 +1345,7 @@ async function saveSettings() {
   localStorage.setItem('historyRetention', historyRetention);
   localStorage.setItem('limitHistory', limitHistory);
   localStorage.setItem('maxCommits', maxCommits);
+  localStorage.setItem('manualMode', manualMode);
   localStorage.setItem('diffViewFormat', newDiffViewFormat);
   localStorage.setItem('diffStyle', newDiffStyle);
 
@@ -1356,6 +1369,7 @@ async function saveSettings() {
         retentionUnit,
         limitHistory,
         maxCommits,
+        manualMode,
         extensions: currentExtensions
       })
     });
@@ -1397,8 +1411,79 @@ async function saveSettings() {
   // Update UI state based on new settings
   try {
     handleRetentionToggle();
+    handleLimitHistoryToggle();
+    handleAutoSaveToggle();
   } catch (e) {
     console.error('Error updating UI state:', e);
+  }
+}
+
+/**
+ * Flush repository (git gc)
+ */
+function flushRepository() {
+  console.log('[UI] flushRepository (open dynamic modal) called');
+  
+  // Create confirmation dialog (same pattern as Reset Timeline modal)
+  const modalHTML = `
+    <div class="modal-backdrop active" id="flush-confirm-modal" onclick="if(event.target === this) closeFlushConfirmDialog()">
+      <div class="modal-content hard-reset-dialog">
+        <h3 data-i18n="settings.flush_repository">${t('settings.flush_repository')}</h3>
+        <p data-i18n="settings.flush_confirm">${t('settings.flush_confirm')}</p>
+        <div class="modal-actions">
+          <button class="btn btn-secondary" onclick="closeFlushConfirmDialog()" data-i18n="app.cancel">${t('app.cancel')}</button>
+          <button class="btn restore" onclick="executeFlush()" data-i18n="settings.flush_repository">${t('settings.flush_repository')}</button>
+        </div>
+      </div>
+    </div>
+  `;
+
+  document.body.insertAdjacentHTML('beforeend', modalHTML);
+  console.log('[UI] Flush confirmation dialog created');
+}
+
+function closeFlushConfirmDialog() {
+  const modal = document.getElementById('flush-confirm-modal');
+  if (modal) {
+    modal.remove();
+  }
+}
+
+/**
+ * Execute the actual flush operation
+ */
+async function executeFlush() {
+  closeFlushConfirmDialog();
+  
+  const btn = document.getElementById('flushBtn');
+  if (btn) {
+    btn.disabled = true;
+  }
+
+  const notification = showNotification(t('settings.flushing'), 'info', 0);
+
+  try {
+    const response = await fetch(`${API}/git/flush`, { 
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' }
+    });
+    const data = await response.json();
+
+    if (notification) notification.remove();
+
+    if (data.success) {
+      showNotification(t('settings.flush_success'), 'success', 3000);
+    } else {
+      showNotification(t('settings.flush_error') + ': ' + (data.error || 'Unknown error'), 'error', 5000);
+    }
+  } catch (error) {
+    if (notification) notification.remove();
+    console.error('[UI] Flush failed:', error);
+    showNotification(t('settings.flush_error'), 'error', 5000);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+    }
   }
 }
 
@@ -1415,6 +1500,61 @@ function handleLimitHistoryToggle() {
   const maxCommitsValueSection = document.getElementById('maxCommitsValueSection');
   if (limitHistory && maxCommitsValueSection) {
     maxCommitsValueSection.style.display = limitHistory.checked ? 'block' : 'none';
+  }
+}
+
+function handleAutoSaveToggle() {
+  const autoSave = document.getElementById('autoSave');
+  const debounceTimeOptions = document.getElementById('debounceTimeOptions');
+  const manualCommitBtn = document.getElementById('manualCommitBtn');
+
+  if (autoSave) {
+    if (debounceTimeOptions) {
+      debounceTimeOptions.style.display = autoSave.checked ? 'block' : 'none';
+    }
+    if (manualCommitBtn) {
+      manualCommitBtn.style.display = autoSave.checked ? 'none' : 'flex';
+    }
+  }
+}
+
+async function triggerManualCommit() {
+  const btn = document.getElementById('manualCommitBtn');
+  if (btn) btn.disabled = true;
+
+  showNotification('Creating manual backup...', 'info', 2000);
+
+  try {
+    const response = await fetch(`${API}/git/commit-manual`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        message: 'Manual mode control'
+      })
+    });
+
+    const data = await response.json();
+
+    if (data.success) {
+      if (data.committed) {
+        showNotification('Backup created successfully', 'success', 3000);
+        // Refresh the timeline
+        if (currentMode === 'timeline') {
+          refreshCurrentView();
+        }
+      } else {
+        showNotification('No changes to backup', 'info', 3000);
+      }
+    } else {
+      showNotification(`Failed to create backup: ${data.error}`, 'error', 5000);
+    }
+  } catch (error) {
+    console.error('Manual commit error:', error);
+    showNotification(`Error: ${error.message}`, 'error', 5000);
+  } finally {
+    if (btn) btn.disabled = false;
   }
 }
 
@@ -5749,14 +5889,18 @@ function showNotification(message, type = 'success', duration = 3000, action = n
   document.body.appendChild(notification);
 
   // Auto-remove after specified duration
-  setTimeout(() => {
-    notification.style.animation = 'notificationSlideOut 0.3s ease-in';
+  if (duration > 0) {
     setTimeout(() => {
-      if (notification.parentNode) {
-        notification.remove();
-      }
-    }, 300);
-  }, duration);
+      notification.style.animation = 'notificationSlideOut 0.3s ease-in';
+      setTimeout(() => {
+        if (notification.parentNode) {
+          notification.remove();
+        }
+      }, 300);
+    }, duration);
+  }
+
+  return notification;
 }
 
 async function restartHomeAssistant() {

@@ -44,6 +44,7 @@
     "single_file_restored_reloaded": "{file} restored and reloaded successfully!",
     "multiple_files_restored": "{count} files restored!",
     "multiple_files_restored_reloaded": "{count} files restored and reloaded successfully!",
+    "backup_now": "Backup Now",
     "reset_all_files": "Reset All Files"
   },
   "file_status": {
@@ -160,8 +161,10 @@
     "retention_type": "Retention Type",
     "retention_value": "Retention Value",
     "retention_unit": "Retention Unit",
-    "run_cleanup_on_commit": "Run Cleanup After Every Version",
     "run_cleanup_on_commit_desc": "Disable this to prevent automatic cleanup after versions (useful for debugging crashes)",
+    "manual_mode": "Manual Mode Only",
+    "auto_save": "Auto Save",
+    "auto_save_desc": "Delay before auto-saving",
     "picasso_enabled": "Picasso Mode enabled!",
     "picasso_disabled": "Picasso Mode disabled",
     "colors_reset": "Colors reset to default",
@@ -212,7 +215,13 @@
     "cloud_connect_github": "Connect GitHub",
     "cloud_github_enter_code": "Enter this code at:",
     "cloud_github_waiting": "Waiting for authorization...",
-    "cloud_disconnect": "Disconnect"
+    "cloud_disconnect": "Disconnect",
+    "flush_repository": "Flush Repository",
+    "flush_repository_desc": "Consolidate history and reduce disk space usage",
+    "flushing": "Flushing repository...",
+    "flush_confirm": "Are you sure you want to flush the repository? This will consolidate history and reduce disk space.",
+    "flush_success": "Repository flushed successfully!",
+    "flush_error": "Failed to flush repository"
   },
   "date_buckets": {
     "today": "Today",
